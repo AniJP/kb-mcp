@@ -14,8 +14,9 @@ Design rules followed throughout:
 from __future__ import annotations
 
 import json
+import logging
 import os
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import urlparse
 
 from mcp.server.mcpserver import MCPServer
@@ -24,11 +25,16 @@ from mcp.server.mcpserver.prompts.base import UserMessage
 from mcp_types import ToolAnnotations
 from pydantic import BaseModel, Field
 
-from kb_mcp.store import KnowledgeStore, Note, NoteNotFound
+from kb_mcp.embeddings import FastEmbedEmbedder
+from kb_mcp.store import KnowledgeStore, Note, NoteNotFound, SearchHit
+
+log = logging.getLogger(__name__)
 
 INSTRUCTIONS = """\
 A personal knowledge base of notes and bookmarks.
 - Use search_notes before answering questions about things the user saved; cite note ids.
+  The default (semantic) mode matches by meaning; use mode="keyword" for exact names, codes or quotes.
+- Use find_similar to explore notes related to one the user is looking at.
 - Use add_note / save_bookmark only when the user asks to save something.
 - delete_note is permanent: confirm with the user first.
 """
@@ -68,7 +74,14 @@ class Hit(BaseModel):
 
 class SearchResult(BaseModel):
     query: str
+    mode: Literal["semantic", "keyword"] = Field(description="The search mode actually used")
     hits: list[Hit]
+    notice: str | None = Field(None, description="Set when semantic search was unavailable and keyword was used")
+
+
+class SimilarResult(BaseModel):
+    note_id: int
+    similar: list[Hit]
 
 
 class NotePage(BaseModel):
@@ -94,12 +107,19 @@ class Deleted(BaseModel):
 Tags = Annotated[list[str], Field(description="Short labels such as 'python' or 'job-search'", max_length=20)]
 
 
+def _hits(hits: list[SearchHit]) -> list[Hit]:
+    return [
+        Hit(id=h.note.id, title=h.note.title, snippet=h.snippet, score=h.score, tags=h.note.tags, url=h.note.url)
+        for h in hits
+    ]
+
+
 def _not_found(e: NoteNotFound) -> ToolError:
     return ToolError(f"No note with id {e.note_id}. Use search_notes or list_notes to find the right id.")
 
 
 def create_server(store: KnowledgeStore) -> MCPServer:
-    mcp = MCPServer(name="knowledge-base", version="0.1.0", instructions=INSTRUCTIONS)
+    mcp = MCPServer(name="knowledge-base", version="0.2.0", instructions=INSTRUCTIONS)
 
     # ----------------------------------------------------------------- tools: read
 
@@ -108,17 +128,42 @@ def create_server(store: KnowledgeStore) -> MCPServer:
         query: Annotated[str, Field(description="Words to look for in titles and bodies", min_length=1)],
         tag: Annotated[str | None, Field(description="Only search notes with this tag")] = None,
         limit: Annotated[int, Field(ge=1, le=50)] = 10,
+        mode: Annotated[
+            Literal["semantic", "keyword"],
+            Field(description="semantic: match by meaning (default). keyword: exact words, ranked by BM25."),
+        ] = "semantic",
     ) -> SearchResult:
-        """Full-text search over notes and bookmarks, best matches first."""
+        """Search notes and bookmarks, best matches first."""
+        notice = None
         try:
-            hits = store.search(query, tag=tag, limit=limit)
+            if mode == "semantic" and store.embedder is not None:
+                try:
+                    return SearchResult(query=query, mode="semantic",
+                                        hits=_hits(store.semantic_search(query, tag=tag, limit=limit)))
+                except ValueError:
+                    raise
+                except Exception as e:  # noqa: BLE001 - model unavailable: degrade to keyword, say so
+                    log.warning("semantic search failed, falling back to keyword: %s", e)
+                    notice = f"Semantic search unavailable ({type(e).__name__}); showing keyword results."
+            elif mode == "semantic":
+                notice = "Semantic search is disabled on this server; showing keyword results."
+            return SearchResult(query=query, mode="keyword", hits=_hits(store.search(query, tag=tag, limit=limit)),
+                                notice=notice)
         except ValueError as e:
             raise ToolError(str(e)) from e
-        return SearchResult(
-            query=query,
-            hits=[Hit(id=h.note.id, title=h.note.title, snippet=h.snippet, score=h.score, tags=h.note.tags,
-                      url=h.note.url) for h in hits],
-        )
+
+    @mcp.tool(title="Find similar notes", annotations=READ)
+    def find_similar(
+        note_id: Annotated[int, Field(ge=1)],
+        limit: Annotated[int, Field(ge=1, le=20)] = 5,
+    ) -> SimilarResult:
+        """Notes closest in meaning to the given note, most similar first."""
+        if store.embedder is None:
+            raise ToolError("Semantic search is disabled on this server.")
+        try:
+            return SimilarResult(note_id=note_id, similar=_hits(store.similar(note_id, limit=limit)))
+        except NoteNotFound as e:
+            raise _not_found(e) from e
 
     @mcp.tool(title="Get note", annotations=READ)
     def get_note(note_id: Annotated[int, Field(ge=1)]) -> NoteOut:
@@ -256,26 +301,50 @@ def create_server(store: KnowledgeStore) -> MCPServer:
         return [
             UserMessage(
                 f"Here is note [{n.id}] '{n.title}':\n\n{n.body}\n\n"
-                "Use the search_notes tool with a few different keyword queries to find related notes, "
-                "then explain how each one connects. Cite note ids."
+                "Use the find_similar tool on this note, and search_notes with a couple of queries for its "
+                "key ideas, to find related notes. Then explain how each one connects. Cite note ids."
             )
         ]
 
     return mcp
 
 
+def build_store(db: str, semantic: bool = True) -> KnowledgeStore:
+    return KnowledgeStore(db, embedder=FastEmbedEmbedder() if semantic else None)
+
+
 def main() -> None:
-    """Entry point: `kb-mcp` (stdio, for Claude Desktop) or `kb-mcp --http` (Streamable HTTP)."""
+    """Entry point.
+
+    kb-mcp                 serve over stdio (what Claude Desktop runs)
+    kb-mcp --http          serve over Streamable HTTP
+    kb-mcp reindex         embed any notes missing embeddings (also downloads the model once)
+    kb-mcp eval            compare keyword vs semantic retrieval on the bundled test set
+    """
     import argparse
 
     parser = argparse.ArgumentParser(description="Personal knowledge-base MCP server")
+    parser.add_argument("command", nargs="?", default="serve", choices=["serve", "reindex", "eval"])
     parser.add_argument("--db", default=os.environ.get("KB_DB_PATH", "~/.kb-mcp/kb.db"), help="SQLite file")
+    parser.add_argument("--no-semantic", action="store_true", help="keyword search only (no embedding model)")
     parser.add_argument("--http", action="store_true", help="serve Streamable HTTP instead of stdio")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
 
-    server = create_server(KnowledgeStore(args.db))
+    if args.command == "eval":
+        from kb_mcp.evaluate import main as eval_main
+
+        eval_main()
+        return
+
+    store = build_store(args.db, semantic=not args.no_semantic)
+    if args.command == "reindex":
+        n = store.reindex()
+        print(f"embedded {n} note(s) with {store.embedder.name if store.embedder else 'no model'}")
+        return
+
+    server = create_server(store)
     if args.http:
         server.run(transport="streamable-http", host=args.host, port=args.port)
     else:

@@ -6,6 +6,7 @@ import pytest
 from mcp import Client
 from mcp.shared.exceptions import MCPError
 
+from kb_mcp.embeddings import HashingEmbedder
 from kb_mcp.server import create_server
 from kb_mcp.store import KnowledgeStore
 
@@ -14,7 +15,7 @@ pytestmark = pytest.mark.anyio
 
 @pytest.fixture
 async def client():
-    async with Client(create_server(KnowledgeStore())) as c:
+    async with Client(create_server(KnowledgeStore(embedder=HashingEmbedder()))) as c:
         yield c
 
 
@@ -28,9 +29,9 @@ async def test_tools_are_listed_with_schemas_and_annotations(client):
     tools = {t.name: t for t in (await client.list_tools()).tools}
     assert set(tools) == {
         "search_notes", "get_note", "list_notes", "list_tags",
-        "add_note", "save_bookmark", "update_note", "delete_note",
+        "add_note", "save_bookmark", "update_note", "delete_note", "find_similar",
     }
-    for name in ("search_notes", "get_note", "list_notes", "list_tags"):
+    for name in ("search_notes", "get_note", "list_notes", "list_tags", "find_similar"):
         assert tools[name].annotations.read_only_hint is True
     assert tools["delete_note"].annotations.destructive_hint is True
     assert tools["update_note"].annotations.idempotent_hint is True
@@ -90,7 +91,7 @@ async def test_resources(client):
     text = (await client.read_resource(f"kb://notes/{n['id']}")).contents[0].text
     assert text.startswith("# Resource me") and "`t`" in text
     stats = json.loads((await client.read_resource("kb://stats")).contents[0].text)
-    assert stats == {"notes": 1, "bookmarks": 0, "tags": 1}
+    assert stats == {"notes": 1, "bookmarks": 0, "tags": 1, "embedded_chunks": 1}
     with pytest.raises(MCPError):
         await client.read_resource("kb://notes/999")
 
@@ -101,3 +102,44 @@ async def test_prompts(client):
     assert names == {"summarize_tag", "find_related"}
     msg = (await client.get_prompt("summarize_tag", {"tag": "streaming"})).messages[0].content.text
     assert "[1] Kafka" in msg and "cite note ids" in msg
+
+
+async def test_search_modes(client):
+    a = await call(client, "add_note", title="Kafka consumer groups", body="partitions and rebalancing")
+    await call(client, "add_note", title="Pasta", body="garlic and olive oil")
+    sem = await call(client, "search_notes", query="kafka partitions")
+    assert sem["mode"] == "semantic" and sem["hits"][0]["id"] == a["id"] and sem["notice"] is None
+    kw = await call(client, "search_notes", query="kafka", mode="keyword")
+    assert kw["mode"] == "keyword" and [h["id"] for h in kw["hits"]] == [a["id"]]
+
+
+async def test_find_similar(client):
+    a = await call(client, "add_note", title="Kafka consumer groups", body="partitions offsets consumers")
+    b = await call(client, "add_note", title="Kafka partitions", body="partitions offsets brokers")
+    await call(client, "add_note", title="Pasta", body="garlic olive oil spaghetti")
+    res = await call(client, "find_similar", note_id=a["id"])
+    ids = [h["id"] for h in res["similar"]]
+    assert a["id"] not in ids and ids[0] == b["id"]
+    r = await client.call_tool("find_similar", {"note_id": 999})
+    assert r.is_error and "No note with id 999" in r.content[0].text
+
+
+class BrokenEmbedder(HashingEmbedder):
+    def embed_query(self, text):
+        raise RuntimeError("model unavailable")
+
+
+async def test_semantic_failure_falls_back_to_keyword_with_notice():
+    async with Client(create_server(KnowledgeStore(embedder=BrokenEmbedder()))) as c:
+        await call(c, "add_note", title="offline note", body="still searchable")
+        res = await call(c, "search_notes", query="offline")
+        assert res["mode"] == "keyword" and res["hits"] and "unavailable" in res["notice"]
+
+
+async def test_semantic_disabled_server():
+    async with Client(create_server(KnowledgeStore())) as c:
+        await call(c, "add_note", title="plain")
+        res = await call(c, "search_notes", query="plain")
+        assert res["mode"] == "keyword" and "disabled" in res["notice"]
+        r = await c.call_tool("find_similar", {"note_id": 1})
+        assert r.is_error

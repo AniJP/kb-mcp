@@ -1,0 +1,490 @@
+{
+ "description": "Small hand-labelled retrieval set. Notes are written like real personal notes; queries are what someone might ask weeks later. 'paraphrase' queries share almost no words with the note they should find; 'exact' queries use a specific name or term from the note.",
+ "notes": [
+  {
+   "key": "duckdb-union",
+   "title": "DuckDB tip",
+   "body": "union_by_name=true makes DuckDB open every file at once. With thousands of JSON files that blew past the memory limit. Read one base model instead.",
+   "tags": [
+    "duckdb"
+   ]
+  },
+  {
+   "key": "dbt-incremental",
+   "title": "dbt incremental models",
+   "body": "Use delete+insert with a unique key when late-arriving rows can change. Merge is fine on warehouses that support it. Always add a full-refresh escape hatch.",
+   "tags": [
+    "dbt"
+   ]
+  },
+  {
+   "key": "airflow-taskflow",
+   "title": "Airflow TaskFlow API",
+   "body": "Decorate Python functions with @task and return values pass between tasks via XCom automatically. Much cleaner than PythonOperator plus manual xcom_pull.",
+   "tags": [
+    "airflow"
+   ]
+  },
+  {
+   "key": "kafka-groups",
+   "title": "Kafka consumer groups",
+   "body": "Each partition is read by exactly one consumer in a group. More consumers than partitions means some sit idle. Rebalancing happens when members join or leave.",
+   "tags": [
+    "streaming"
+   ]
+  },
+  {
+   "key": "brier",
+   "title": "Brier score",
+   "body": "Mean squared error between predicted probabilities and 0/1 outcomes. Lower is better; always compare against a baseline that predicts the base rate.",
+   "tags": [
+    "ml"
+   ]
+  },
+  {
+   "key": "doubly-robust",
+   "title": "Doubly robust estimation",
+   "body": "Combine an outcome model and a propensity model. The estimate stays consistent if either one is right. Use cross-fitting to avoid overfitting bias.",
+   "tags": [
+    "causal"
+   ]
+  },
+  {
+   "key": "conformal",
+   "title": "Conformal prediction",
+   "body": "Calibrate prediction intervals on held-out data so coverage matches the target, whatever the model. Split conformal needs only one calibration set.",
+   "tags": [
+    "ml"
+   ]
+  },
+  {
+   "key": "power",
+   "title": "Sample size for A/B tests",
+   "body": "Required units grow with variance and shrink with the square of the effect. Halving the detectable effect needs four times the traffic. Run A/A tests first.",
+   "tags": [
+    "experiments"
+   ]
+  },
+  {
+   "key": "cuped",
+   "title": "CUPED",
+   "body": "Regress the outcome on a pre-experiment covariate and analyse the residual. Variance falls by the squared correlation, so the test needs fewer users.",
+   "tags": [
+    "experiments"
+   ]
+  },
+  {
+   "key": "leakage",
+   "title": "Point-in-time features",
+   "body": "Only use information available at prediction time. Seller history must count orders delivered before checkout, or the model sees the future.",
+   "tags": [
+    "ml",
+    "data-eng"
+   ]
+  },
+  {
+   "key": "git-identity",
+   "title": "Git commits not on my profile",
+   "body": "GitHub only links commits whose author email is on the account. Set user.email globally and amend with --reset-author.",
+   "tags": [
+    "git"
+   ]
+  },
+  {
+   "key": "conda-venv",
+   "title": "pytest picked the wrong Python",
+   "body": "With the conda base env active, the pytest command came from anaconda instead of the venv. conda deactivate, recreate the venv, and use python -m pytest.",
+   "tags": [
+    "python"
+   ]
+  },
+  {
+   "key": "mcp-annotations",
+   "title": "MCP tool annotations",
+   "body": "readOnlyHint, destructiveHint and idempotentHint let clients auto-approve safe tools and ask before dangerous ones.",
+   "tags": [
+    "mcp"
+   ]
+  },
+  {
+   "key": "fts-injection",
+   "title": "Sanitising full-text queries",
+   "body": "Quote every token before passing user input to SQLite FTS5 so stray quotes or AND/OR/NEAR cannot break or change the query.",
+   "tags": [
+    "sqlite"
+   ]
+  },
+  {
+   "key": "pasta",
+   "title": "Weeknight pasta",
+   "body": "Garlic, chilli flakes and olive oil, then toss with spaghetti and a splash of the cooking water. Ten minutes.",
+   "tags": [
+    "cooking"
+   ]
+  },
+  {
+   "key": "sourdough",
+   "title": "Sourdough starter",
+   "body": "Feed equal weights of flour and water daily. It is ready when it doubles within six hours and smells tangy, not like nail polish.",
+   "tags": [
+    "cooking"
+   ]
+  },
+  {
+   "key": "run-plan",
+   "title": "Half marathon plan",
+   "body": "Three easy runs, one tempo and one long run a week. Increase the long run by about ten percent weekly, with a lighter week every fourth.",
+   "tags": [
+    "fitness"
+   ]
+  },
+  {
+   "key": "sleep",
+   "title": "Sleep routine",
+   "body": "No screens for the last half hour, same wake-up time on weekends, and keep the bedroom cool.",
+   "tags": [
+    "health-habits"
+   ]
+  },
+  {
+   "key": "passport",
+   "title": "Passport renewal",
+   "body": "Renew at least six months before it expires; some countries refuse entry with less validity. Keep the application receipt number to track status online.",
+   "tags": [
+    "admin"
+   ]
+  },
+  {
+   "key": "lease",
+   "title": "Apartment lease renewal",
+   "body": "Landlord needs 60 days notice before the lease ends. Ask about a rent freeze in exchange for signing for 18 months.",
+   "tags": [
+    "admin"
+   ]
+  },
+  {
+   "key": "interview-star",
+   "title": "Behavioural interview answers",
+   "body": "Situation, task, action, result. Keep the action part longest and say I, not we. Prepare one story about a failure.",
+   "tags": [
+    "job-search"
+   ]
+  },
+  {
+   "key": "resume-bullets",
+   "title": "Resume bullet formula",
+   "body": "What you built, the technology, who it helped, and a result you can explain in an interview. Never invent numbers.",
+   "tags": [
+    "job-search"
+   ]
+  },
+  {
+   "key": "salary",
+   "title": "Negotiating an offer",
+   "body": "Let them name a number first, ask for time to consider, and negotiate the total package including signing bonus and start date.",
+   "tags": [
+    "job-search"
+   ]
+  },
+  {
+   "key": "streamlit-cloud",
+   "title": "Deploying a Streamlit app",
+   "body": "Push to GitHub, point share.streamlit.io at the repo and the app file, and keep a requirements.txt next to the app.",
+   "tags": [
+    "streamlit"
+   ]
+  },
+  {
+   "key": "docker-layers",
+   "title": "Smaller Docker images",
+   "body": "Copy the dependency file and install before copying source, so code changes do not bust the cache. Use slim base images and multi-stage builds.",
+   "tags": [
+    "docker"
+   ]
+  },
+  {
+   "key": "index",
+   "title": "When a database index helps",
+   "body": "Indexes speed up selective lookups and joins but slow down writes. Check the query plan before adding one.",
+   "tags": [
+    "sql"
+   ]
+  },
+  {
+   "key": "window-fns",
+   "title": "SQL window functions",
+   "body": "row_number over a partition picks the latest record per key. qualify filters on it without a subquery in DuckDB and Snowflake.",
+   "tags": [
+    "sql"
+   ]
+  },
+  {
+   "key": "rag-chunking",
+   "title": "Chunking for RAG",
+   "body": "Split long documents into overlapping passages so each embedding covers one topic. Too large blurs topics, too small loses context.",
+   "tags": [
+    "llm"
+   ]
+  },
+  {
+   "key": "prompt-caching",
+   "title": "Cutting LLM API costs",
+   "body": "Put stable instructions first so the provider can cache the prompt prefix, and batch requests that are not urgent.",
+   "tags": [
+    "llm"
+   ]
+  },
+  {
+   "key": "book-deep-work",
+   "title": "Deep Work notes",
+   "body": "Schedule long blocks without notifications for hard thinking. Shallow tasks expand to fill the time you give them.",
+   "tags": [
+    "books"
+   ]
+  },
+  {
+   "key": "flight",
+   "title": "Booking flights home",
+   "body": "Holiday fares were lowest booking about seven weeks ahead, flying mid-week, with one stop.",
+   "tags": [
+    "travel"
+   ]
+  },
+  {
+   "key": "budget",
+   "title": "Monthly budget",
+   "body": "Rent first, then groceries and transit. Move savings automatically on payday so it never feels available to spend.",
+   "tags": [
+    "money"
+   ]
+  }
+ ],
+ "queries": [
+  {
+   "q": "my query ran out of RAM when reading lots of files",
+   "relevant": [
+    "duckdb-union"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "how do I process only new rows instead of rebuilding the table",
+   "relevant": [
+    "dbt-incremental"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "passing results between pipeline steps in the orchestrator",
+   "relevant": [
+    "airflow-taskflow"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "why are some of my message readers doing nothing",
+   "relevant": [
+    "kafka-groups"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "how to judge whether predicted probabilities are any good",
+   "relevant": [
+    "brier",
+    "conformal"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "estimating treatment effects when one of my models might be wrong",
+   "relevant": [
+    "doubly-robust"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "how much traffic does an experiment need",
+   "relevant": [
+    "power",
+    "cuped"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "making experiments reach significance with fewer users",
+   "relevant": [
+    "cuped"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "my model accidentally used data from the future",
+   "relevant": [
+    "leakage"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "my contributions are not showing up on my developer profile",
+   "relevant": [
+    "git-identity"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "tests ran with the wrong interpreter",
+   "relevant": [
+    "conda-venv"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "letting the assistant run safe actions without asking",
+   "relevant": [
+    "mcp-annotations"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "quick dinner idea",
+   "relevant": [
+    "pasta"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "baking bread at home",
+   "relevant": [
+    "sourdough"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "training for a race",
+   "relevant": [
+    "run-plan"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "my travel document is about to expire",
+   "relevant": [
+    "passport"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "how to answer tell me about a time questions",
+   "relevant": [
+    "interview-star"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "getting paid more when I get a job offer",
+   "relevant": [
+    "salary"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "putting my dashboard online for free",
+   "relevant": [
+    "streamlit-cloud"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "container builds are slow and huge",
+   "relevant": [
+    "docker-layers"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "getting the most recent record for each customer",
+   "relevant": [
+    "window-fns"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "how to split documents before embedding them",
+   "relevant": [
+    "rag-chunking"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "saving money on AI model bills",
+   "relevant": [
+    "prompt-caching"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "staying focused without distractions",
+   "relevant": [
+    "book-deep-work"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "cheap plane tickets for the holidays",
+   "relevant": [
+    "flight"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "union_by_name",
+   "relevant": [
+    "duckdb-union"
+   ],
+   "type": "exact"
+  },
+  {
+   "q": "XCom",
+   "relevant": [
+    "airflow-taskflow"
+   ],
+   "type": "exact"
+  },
+  {
+   "q": "FTS5",
+   "relevant": [
+    "fts-injection"
+   ],
+   "type": "exact"
+  },
+  {
+   "q": "CUPED",
+   "relevant": [
+    "cuped"
+   ],
+   "type": "exact"
+  },
+  {
+   "q": "application receipt number",
+   "relevant": [
+    "passport"
+   ],
+   "type": "exact"
+  },
+  {
+   "q": "Brier score baseline",
+   "relevant": [
+    "brier"
+   ],
+   "type": "exact"
+  },
+  {
+   "q": "multi-stage builds",
+   "relevant": [
+    "docker-layers"
+   ],
+   "type": "exact"
+  }
+ ]
+}

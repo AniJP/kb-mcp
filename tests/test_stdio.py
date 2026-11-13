@@ -11,7 +11,7 @@ pytestmark = pytest.mark.anyio
 
 async def test_stdio_server_roundtrip(tmp_path):
     params = StdioServerParameters(
-        command=sys.executable, args=["-m", "kb_mcp.server", "--db", str(tmp_path / "kb.db")]
+        command=sys.executable, args=["-m", "kb_mcp.server", "--db", str(tmp_path / "kb.db"), "--no-semantic"]
     )
     async with Client(params) as c:
         r = await c.call_tool("add_note", {"title": "over stdio"})

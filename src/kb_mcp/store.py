@@ -7,6 +7,8 @@ search, ingestion) plug in behind the same interface.
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import re
 import sqlite3
 from collections.abc import Iterator
@@ -15,7 +17,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+import numpy as np
+
+from kb_mcp.embeddings import Embedder, chunk_text
+
+log = logging.getLogger(__name__)
+
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 create table if not exists notes (
@@ -44,6 +52,18 @@ end;
 create trigger if not exists notes_ad after delete on notes begin
     insert into notes_fts(notes_fts, rowid, title, body) values ('delete', old.id, old.title, old.body);
 end;
+-- Phase 2: one row per chunk of a note, with its embedding (float32 bytes) and the model that
+-- produced it. content_hash detects notes edited since they were embedded.
+create table if not exists note_chunks (
+    note_id       integer not null references notes(id) on delete cascade,
+    chunk_index   integer not null,
+    text          text not null,
+    model         text not null,
+    content_hash  text not null,
+    embedding     blob not null,
+    primary key (note_id, chunk_index)
+);
+
 create trigger if not exists notes_au after update on notes begin
     insert into notes_fts(notes_fts, rowid, title, body) values ('delete', old.id, old.title, old.body);
     insert into notes_fts(rowid, title, body) values (new.id, new.title, new.body);
@@ -105,12 +125,37 @@ def _fts_query(text: str) -> str:
     return " ".join(quoted)
 
 
+def _trim(text: str, query: str = "", words: int = 30) -> str:
+    """A `words`-long window of `text`, placed where it shares the most words with the query."""
+    parts = text.split()
+    if len(parts) <= words:
+        return text
+    wanted = set(re.findall(r"\w+", query.lower()))
+    start = 0
+    if wanted:
+        hits = [1 if set(re.findall(r"\w+", p.lower())) & wanted else 0 for p in parts]
+        window = sum(hits[:words])
+        best = window
+        for i in range(1, len(parts) - words + 1):
+            window += hits[i + words - 1] - hits[i - 1]
+            if window > best:
+                best, start = window, i
+    out = " ".join(parts[start : start + words])
+    return ("… " if start > 0 else "") + out + (" …" if start + words < len(parts) else "")
+
+
+def _content_hash(title: str, body: str) -> str:
+    return hashlib.sha256(f"{title}\n{body}".encode()).hexdigest()
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 class KnowledgeStore:
-    def __init__(self, path: str | Path = ":memory:"):
+    def __init__(self, path: str | Path = ":memory:", embedder: Embedder | None = None):
+        self.embedder = embedder
+        self._vectors: tuple[np.ndarray, np.ndarray, list[str]] | None = None  # (note_ids, matrix, texts)
         self.path = str(path)
         if self.path != ":memory:":
             Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
@@ -208,6 +253,7 @@ class KnowledgeStore:
             "notes": c.execute("select count(*) from notes where url is null").fetchone()[0],
             "bookmarks": c.execute("select count(*) from notes where url is not null").fetchone()[0],
             "tags": c.execute("select count(distinct tag) from note_tags").fetchone()[0],
+            "embedded_chunks": c.execute("select count(*) from note_chunks").fetchone()[0],
         }
 
     # ------------------------------------------------------------------ writes
@@ -225,6 +271,7 @@ class KnowledgeStore:
             )
             note_id = cur.lastrowid
             c.executemany("insert into note_tags values (?, ?)", [(note_id, t) for t in clean_tags])
+        self._embed_quietly(note_id, title, body)
         return self.get(note_id)
 
     def update(
@@ -254,10 +301,134 @@ class KnowledgeStore:
             if tags is not None:
                 c.execute("delete from note_tags where note_id = ?", (note_id,))
                 c.executemany("insert into note_tags values (?, ?)", [(note_id, t) for t in normalize_tags(tags)])
-        return self.get(note_id)
+        updated = self.get(note_id)
+        self._embed_quietly(note_id, updated.title, updated.body)
+        return updated
 
     def delete(self, note_id: int) -> Note:
         note = self.get(note_id)
         with self._tx() as c:
             c.execute("delete from notes where id = ?", (note_id,))
+        self._vectors = None
         return note
+
+    # ------------------------------------------------------------------ embeddings (Phase 2)
+
+    def _embed_note(self, note_id: int, title: str, body: str) -> None:
+        assert self.embedder is not None
+        chunks = chunk_text(title, body)
+        vectors = self.embedder.embed_documents(chunks)
+        digest = _content_hash(title, body)
+        with self._tx() as c:
+            c.execute("delete from note_chunks where note_id = ?", (note_id,))
+            c.executemany(
+                "insert into note_chunks values (?, ?, ?, ?, ?, ?)",
+                [
+                    (note_id, i, text, self.embedder.name, digest, vec.astype(np.float32).tobytes())
+                    for i, (text, vec) in enumerate(zip(chunks, vectors, strict=True))
+                ],
+            )
+        self._vectors = None
+
+    def _embed_quietly(self, note_id: int, title: str, body: str) -> None:
+        """Embed on write, but never let a missing model (e.g. offline) block saving a note.
+
+        A note that fails here is simply stale and gets embedded by the next reindex().
+        """
+        if self.embedder is None:
+            return
+        try:
+            self._embed_note(note_id, title, body)
+        except Exception as e:  # noqa: BLE001 - any model/runtime failure must not lose the user's write
+            log.warning("embedding note %s failed, will retry on reindex: %s", note_id, e)
+
+    def stale_note_ids(self) -> list[int]:
+        """Notes with no embeddings from the current model, or edited since they were embedded."""
+        if self.embedder is None:
+            return []
+        rows = self._conn.execute(
+            """
+            select n.id, n.title, n.body,
+                   (select content_hash from note_chunks c where c.note_id = n.id and c.model = ? limit 1) as h
+            from notes n
+            """,
+            (self.embedder.name,),
+        ).fetchall()
+        return [r["id"] for r in rows if r["h"] != _content_hash(r["title"], r["body"])]
+
+    def reindex(self) -> int:
+        """Embed every stale note. Cheap when nothing changed. Returns how many notes were embedded."""
+        stale = self.stale_note_ids()
+        for note_id in stale:
+            n = self.get(note_id)
+            self._embed_note(n.id, n.title, n.body)
+        return len(stale)
+
+    def _load_vectors(self) -> tuple[np.ndarray, np.ndarray, list[str]]:
+        if self._vectors is None:
+            assert self.embedder is not None
+            rows = self._conn.execute(
+                "select note_id, text, embedding from note_chunks where model = ? order by note_id, chunk_index",
+                (self.embedder.name,),
+            ).fetchall()
+            if rows:
+                ids = np.array([r["note_id"] for r in rows])
+                matrix = np.stack([np.frombuffer(r["embedding"], dtype=np.float32) for r in rows])
+            else:
+                ids, matrix = np.zeros(0, dtype=int), np.zeros((0, 1), dtype=np.float32)
+            self._vectors = (ids, matrix, [r["text"] for r in rows])
+        return self._vectors
+
+    def _rank_notes(self, sims: np.ndarray, ids: np.ndarray, texts: list[str],
+                    allowed: set[int] | None, exclude: int | None, limit: int, query: str = "") -> list[SearchHit]:
+        """Best-scoring chunk per note, highest first."""
+        best: dict[int, tuple[float, str]] = {}
+        for i in np.argsort(-sims):
+            nid = int(ids[i])
+            if nid == exclude or (allowed is not None and nid not in allowed) or nid in best:
+                continue
+            best[nid] = (float(sims[i]), texts[i])
+            if len(best) == limit:
+                break
+        notes = {n.id: n for n in self._to_notes(
+            self._conn.execute(
+                f"select * from notes where id in ({','.join('?' * len(best))})", list(best)
+            ).fetchall()
+        )} if best else {}
+        return [
+            SearchHit(notes[nid], round(score, 4), _trim(text.split("\n", 1)[-1], query))
+            for nid, (score, text) in best.items()
+        ]
+
+    def _ids_with_tag(self, tag: str | None) -> set[int] | None:
+        if not tag:
+            return None
+        t = normalize_tags([tag])[0]
+        return {r[0] for r in self._conn.execute("select note_id from note_tags where tag = ?", (t,))}
+
+    def semantic_search(self, query: str, tag: str | None = None, limit: int = 10) -> list[SearchHit]:
+        """Rank notes by cosine similarity between the query and each note's best chunk."""
+        if self.embedder is None:
+            raise RuntimeError("semantic search needs an embedder")
+        if not query.strip():
+            return []
+        self.reindex()
+        ids, matrix, texts = self._load_vectors()
+        if len(ids) == 0:
+            return []
+        sims = matrix @ self.embedder.embed_query(query)
+        return self._rank_notes(sims, ids, texts, self._ids_with_tag(tag), None, limit, query)
+
+    def similar(self, note_id: int, limit: int = 5) -> list[SearchHit]:
+        """Notes closest in meaning to `note_id` (its chunks averaged into one vector)."""
+        if self.embedder is None:
+            raise RuntimeError("similarity needs an embedder")
+        self.get(note_id)  # raises NoteNotFound
+        self.reindex()
+        ids, matrix, texts = self._load_vectors()
+        own = matrix[ids == note_id]
+        if len(own) == 0 or len(ids) == len(own):
+            return []
+        centre = own.mean(axis=0)
+        centre /= np.linalg.norm(centre) or 1.0
+        return self._rank_notes(matrix @ centre, ids, texts, None, note_id, limit)
