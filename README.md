@@ -1,8 +1,8 @@
 # kb-mcp — a personal knowledge-base MCP server
 
-An [MCP](https://modelcontextprotocol.io) server that gives an AI assistant a long-term memory you control: save notes and bookmarks, find them by **meaning** or by exact words, and pull them into a conversation. It is built from scratch on the official MCP Python SDK (v2), with SQLite storage, a local embedding model (no API key, nothing leaves your machine), and tests at the protocol level.
+An [MCP](https://modelcontextprotocol.io) server that gives an AI assistant a long-term memory you control: save notes and bookmarks, find them with **hybrid search** (meaning + exact words, optionally re-ranked by a cross-encoder), and pull them into a conversation. It is built from scratch on the official MCP Python SDK (v2), with SQLite storage, a local embedding model (no API key, nothing leaves your machine), and tests at the protocol level.
 
-> **Status:** Phases 1 (MCP fundamentals) and 2 (semantic search) complete. See the [roadmap](#roadmap).
+> **Status:** Phases 1–3 (MCP fundamentals, semantic search, hybrid search + evaluation) complete. See the [roadmap](#roadmap).
 
 ## What the assistant gets
 
@@ -10,7 +10,7 @@ An [MCP](https://modelcontextprotocol.io) server that gives an AI assistant a lo
 
 | Tool | Does | Annotations |
 |---|---|---|
-| `search_notes(query, tag?, limit?, mode?)` | `semantic` (default): match by meaning with local embeddings. `keyword`: exact words, BM25-ranked. | read-only |
+| `search_notes(query, tag?, limit?, mode?)` | `hybrid` (default): keyword + semantic fused with Reciprocal Rank Fusion, optionally re-ranked. `semantic`: meaning only. `keyword`: exact words, BM25. | read-only |
 | `find_similar(note_id, limit?)` | Notes closest in meaning to a given note | read-only |
 | `get_note(note_id)` | One note in full | read-only |
 | `list_notes(tag?, limit?, offset?)` | Recent notes, paginated with `next_offset` | read-only |
@@ -41,25 +41,54 @@ Engineering choices:
 - **Always consistent.** Notes are re-embedded when saved or edited. A content hash and the model name detect anything stale, including notes saved before Phase 2 existed or after a model change, and fix it before searching.
 - **Fails soft.** If the model can't load (for example, offline on first run), saving still works, and search falls back to keyword mode with a `notice` saying so, rather than erroring.
 
+## How hybrid search works (Phase 3)
+
+Keyword and semantic search fail in opposite places:
+- **Embeddings** blur codes and identifiers. `23505`, `B905` and `HEAD@{2}` carry almost no meaning.
+- **Keyword search** misses anything phrased differently.
+
+Hybrid search runs both and merges them:
+1. **Two candidate lists.** BM25 in *any-term* mode (any word may match, so it finds more candidates) and semantic search each return their top 30.
+2. **Reciprocal Rank Fusion.** Each note scores `Σ 1/(60 + rank)` across the two lists. RRF uses ranks, not raw scores, so BM25 and cosine similarity never need calibrating against each other. A note found by both lists rises highest.
+3. **Optional re-ranking** (`kb-mcp --rerank`). A cross-encoder ([ms-marco-MiniLM-L-6-v2](https://huggingface.co/cross-encoder/ms-marco-MiniLM-L-6-v2), about 80 MB, local) reads the query and each of the top 20 candidates *together* and re-orders them. It is more accurate than comparing vectors and much slower, so it only touches the shortlist.
+
+Every step fails soft:
+- No embedding model: keyword results, with a notice.
+- No re-ranker: fused results, with a notice.
+
 ## Measuring it
 
-`kb-mcp eval` loads a small hand-labelled set ([`eval_data.json`](src/kb_mcp/eval_data.json): 32 notes, 32 queries) into a throwaway store and compares the two modes. *Paraphrase* queries share almost no words with the note they should find ("my query ran out of RAM" → the DuckDB `union_by_name` note); *exact* queries use a specific term ("XCom").
+`kb-mcp eval` loads a hand-labelled set ([`eval_data.json`](src/kb_mcp/eval_data.json): 52 notes, 60 queries) into a throwaway store and scores every mode on recall@5, MRR, nDCG@5 and latency. The queries are deliberately mixed so no single method can look perfect:
 
-| Mode | Query type | Queries | Recall@5 | MRR |
-|---|---|---|---|---|
-| keyword | paraphrase | 25 | 0.00 | 0.00 |
-| keyword | exact | 7 | 1.00 | 1.00 |
-| **semantic** | **paraphrase** | 25 | **1.00** | **0.90** |
-| semantic | exact | 7 | 1.00 | 1.00 |
-| keyword | all | 32 | 0.22 | 0.22 |
-| **semantic** | **all** | 32 | **1.00** | **0.92** |
+| Query type | n | Example | Hard for |
+|---|---|---|---|
+| paraphrase | 31 | "my container keeps getting killed" → the exit-code-137 note | keyword |
+| exact | 7 | "XCom" | — |
+| identifier | 11 | "23505", "B905", "0 6 * * 1-5" | embeddings |
+| fine-grained | 11 | "why did old messages disappear from my topic" among four near-identical Kafka notes | both |
 
-**Reading it:**
-- Keyword search finds nothing for paraphrases. That's partly by design: it requires every query word to appear, which keeps exact lookups precise.
-- Semantic search puts the right note in the top 5 for every query, and first for most of them (MRR 0.92). It loses nothing on exact-term queries.
-- **Caveat:** 32 hand-written queries is a small, friendly test. Phase 3 builds a larger and harder evaluation set, where keyword and semantic each fail on different queries, to justify combining them.
+**Results** (MacBook Air, Apple Silicon; MRR = how often the right note comes first, 1.0 = always):
 
-*Model: BAAI/bge-small-en-v1.5 via fastembed, run on a MacBook Air (Apple Silicon).*
+| Query type | n | keyword | semantic | **hybrid** (default) | hybrid + re-rank |
+|---|---|---|---|---|---|
+| paraphrase | 31 | 0.00 | **0.91** | 0.85 | 0.87 |
+| exact | 7 | 1.00 | 1.00 | 1.00 | 1.00 |
+| identifier | 11 | 1.00 | 1.00 | 1.00 | 1.00 |
+| fine-grained | 11 | 0.00 | 0.79 | 0.85 | **0.88** |
+| **all (MRR)** | 60 | 0.30 | **0.92** | 0.90 | 0.91 |
+| all (recall@5) | 60 | 0.30 | 0.97 | 0.97 | 0.97 |
+| all (nDCG@5) | 60 | 0.30 | 0.92 | 0.91 | 0.92 |
+| median latency | | 0.1 ms | 2.5 ms | 2.7 ms | 79 ms |
+
+**What the evaluation changed**
+- **The first version of hybrid search was worse than semantic alone** (MRR 0.88 vs 0.92, and 0.82 vs 0.91 on paraphrases). Its misses pointed to the cause: in a small corpus, function words like "my" and "how" are *rare*, so BM25 gave them high weight, and "my query ran out of RAM" matched notes that happened to contain "my". Dropping stopwords from the keyword half raised hybrid to recall@5 0.97 and MRR 0.90. A test now guards against the regression.
+- **Down-weighting the keyword list (0.5×) changed nothing**, so the problem was noisy keyword candidates, not the fusion weights.
+
+**Conclusions**
+- **Semantic and hybrid are statistically tied.** The 0.02 MRR gap is about one query out of 60. Each wins where you'd expect: semantic on paraphrases, hybrid on near-duplicates.
+- **Hybrid stays the default.** It equals semantic on recall, is better at telling near-identical notes apart, and keeps an exact-match path for codes in a larger, messier notebook. In this set the embeddings happened to handle every identifier anyway.
+- **Re-ranking is optional** (`--rerank`). It is the best mode on near-duplicates (recall@5 1.00, MRR 0.88) but about 30× slower and no better overall.
+- **Caveat:** 60 hand-written queries is small, and the dataset was extended while this phase was being built. Treat these as directional, not definitive.
 
 ## Design decisions
 
@@ -76,9 +105,10 @@ Engineering choices:
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest                         # 41 tests: storage, semantic search, protocol, real stdio round-trip
+pytest                         # 52 tests: storage, semantic + hybrid search, protocol, real stdio round-trip
 kb-mcp reindex                 # one-time: downloads the embedding model and embeds existing notes
-kb-mcp eval                    # keyword vs semantic retrieval quality
+kb-mcp eval                    # keyword vs semantic vs hybrid vs re-ranked, by query type
+kb-mcp --rerank                # serve with cross-encoder re-ranking on
 kb-mcp --db ~/.kb-mcp/kb.db    # stdio
 kb-mcp --http --port 8765      # Streamable HTTP at http://127.0.0.1:8765/mcp
 ```
@@ -111,7 +141,7 @@ npx @modelcontextprotocol/inspector .venv/bin/kb-mcp
 | File | What it proves |
 |---|---|
 | `tests/test_store.py` | CRUD, tag normalisation, BM25 ranking (title > body), prefix search, index consistency after update and delete, FTS-syntax safety, persistence |
-| `tests/test_semantic.py` | Chunking, embedding on write, staleness after edits and model changes, legacy-database backfill, best-chunk ranking, tag filter, similarity, failure never losing a write, eval harness |
+| `tests/test_semantic.py` | Chunking, embedding on write, staleness after edits and model changes, legacy-database backfill, best-chunk ranking, tag filter, similarity, failure never losing a write, RRF fusion, identifier rescue, re-ranking, eval harness and dataset integrity |
 | `tests/test_server.py` | Through a real MCP client (in-process): tool schemas and annotations, structured output, error contract, input validation, pagination, resources, prompts, search modes, fallback notices |
 | `tests/test_stdio.py` | The server launched as a subprocess over stdio, the way Claude Desktop runs it |
 
@@ -121,7 +151,7 @@ npx @modelcontextprotocol/inspector .venv/bin/kb-mcp
 |---|---|---|
 | 1. MCP fundamentals | Tools, resources, prompts, annotations, structured output, stdio + HTTP | ✅ |
 | 2. Semantic search | Local embeddings, chunking, vector search, `find_similar`, retrieval eval | ✅ |
-| 3. Hybrid search | BM25 + vectors with rank fusion and re-ranking; retrieval evaluation set | |
+| 3. Hybrid search | BM25 + vectors with RRF, cross-encoder re-ranking, harder evaluation (identifier and near-duplicate queries) | ✅ |
 | 4. Ingestion pipeline | Import from files, web pages and bookmarks exports; chunking, dedup, scheduled refresh | |
 | 5. Agent memory | Memories the assistant writes itself, with recency and importance scoring | |
 
@@ -129,8 +159,8 @@ npx @modelcontextprotocol/inspector .venv/bin/kb-mcp
 
 ```
 src/kb_mcp/store.py        SQLite storage: notes, FTS5 keyword index, embeddings (no MCP dependency)
-src/kb_mcp/embeddings.py   embedding models (local fastembed + an offline test double) and chunking
-src/kb_mcp/evaluate.py     retrieval evaluation (recall@5, MRR) on eval_data.json
+src/kb_mcp/embeddings.py   embedding + re-ranking models (local fastembed, offline test doubles) and chunking
+src/kb_mcp/evaluate.py     retrieval evaluation (recall@5, MRR, nDCG@5, latency) on eval_data.json
 src/kb_mcp/server.py       MCP tools, resources, prompts, CLI entry point
 tests/                 storage, protocol and stdio tests
 ```

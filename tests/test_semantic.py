@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from kb_mcp import evaluate
-from kb_mcp.embeddings import HashingEmbedder, chunk_text
+from kb_mcp.embeddings import HashingEmbedder, OverlapReranker, chunk_text
 from kb_mcp.store import KnowledgeStore, NoteNotFound
 
 
@@ -105,10 +105,75 @@ def test_similar_excludes_self_and_checks_id(store):
 
 def test_eval_harness_runs_and_scores():
     data = evaluate.load_dataset()
-    results = evaluate.run(embedder=HashingEmbedder(), data=data)
-    for mode in ("keyword", "semantic"):
+    results = evaluate.run(embedder=HashingEmbedder(), reranker=OverlapReranker(), data=data)
+    assert set(results) == {"keyword", "semantic", "hybrid", "hybrid kw=0.5", "hybrid+rerank"}
+    for mode in results:
         s = evaluate.summarise(results[mode])
         assert s["all"]["queries"] == len(data["queries"])
         assert 0.0 <= s["all"]["mrr"] <= 1.0
     # Exact-term queries are what keyword search is built for.
     assert evaluate.summarise(results["keyword"])["exact"]["recall@5"] >= 0.8
+
+
+def test_eval_dataset_is_consistent():
+    data = evaluate.load_dataset()
+    keys = [n["key"] for n in data["notes"]]
+    assert len(keys) == len(set(keys))
+    assert all(r in keys for q in data["queries"] for r in q["relevant"])
+    assert {q["type"] for q in data["queries"]} == {"paraphrase", "exact", "identifier", "fine-grained"}
+
+
+def test_ndcg():
+    assert evaluate.ndcg_at_k(["a", "b"], {"a"}, 5) == 1.0
+    assert evaluate.ndcg_at_k(["b", "a"], {"a"}, 5) == pytest.approx(1 / np.log2(3))
+    assert evaluate.ndcg_at_k(["x"], {"a"}, 5) == 0.0
+
+
+def test_any_terms_keyword_search_is_broader(store):
+    store.add("Kafka retention", "segments deleted after retention.ms")
+    assert store.search("kafka lost messages") == []  # every word required
+    assert store.search("kafka lost messages", any_terms=True)[0].note.title == "Kafka retention"
+
+
+def test_hybrid_rescues_identifier_queries(store):
+    """An identifier that embeddings treat as noise is still found through the keyword list."""
+    target = store.add("Postgres error 23505", "unique_violation on insert")
+    for i in range(8):
+        store.add(f"Postgres note {i}", "postgres error insert tips")
+    assert store.hybrid_search("23505")[0].note.id == target.id
+
+
+def test_rrf_rewards_agreement(store):
+    both = store.add("Kafka consumer groups", "kafka partitions consumer groups")
+    store.add("Kafka only in title", "nothing else")
+    store.add("Groups", "consumer groups for a book club")
+    hits = store.hybrid_search("kafka consumer groups")
+    assert hits[0].note.id == both.id
+    assert hits[0].score > hits[1].score
+
+
+def test_reranker_reorders_top_candidates(store):
+    store.add("Alpha", "kafka")
+    best = store.add("Beta", "kafka retention segments deleted")
+    hits = store.hybrid_search("kafka retention segments deleted", reranker=OverlapReranker())
+    assert hits[0].note.id == best.id
+
+
+def test_any_terms_ignores_function_words(store):
+    store.add("My notes on cooking", "my my my")
+    target = store.add("DuckDB memory", "ran out of RAM reading files")
+    hits = store.search("my query ran out of RAM", any_terms=True)
+    assert hits[0].note.id == target.id
+
+
+def test_all_stopword_query_still_searches(store):
+    store.add("How to", "how to do it")
+    assert store.search("how to", any_terms=True)
+
+
+def test_keyword_weight_scales_the_keyword_list(store):
+    store.add("Alpha", "zebra")
+    store.add("Beta", "zebra zebra")
+    full = store.hybrid_search("zebra")
+    half = store.hybrid_search("zebra", keyword_weight=0.5)
+    assert half[0].score < full[0].score

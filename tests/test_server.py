@@ -6,7 +6,7 @@ import pytest
 from mcp import Client
 from mcp.shared.exceptions import MCPError
 
-from kb_mcp.embeddings import HashingEmbedder
+from kb_mcp.embeddings import HashingEmbedder, OverlapReranker
 from kb_mcp.server import create_server
 from kb_mcp.store import KnowledgeStore
 
@@ -107,8 +107,11 @@ async def test_prompts(client):
 async def test_search_modes(client):
     a = await call(client, "add_note", title="Kafka consumer groups", body="partitions and rebalancing")
     await call(client, "add_note", title="Pasta", body="garlic and olive oil")
-    sem = await call(client, "search_notes", query="kafka partitions")
-    assert sem["mode"] == "semantic" and sem["hits"][0]["id"] == a["id"] and sem["notice"] is None
+    hyb = await call(client, "search_notes", query="kafka partitions")
+    assert hyb["mode"] == "hybrid" and hyb["hits"][0]["id"] == a["id"] and hyb["notice"] is None
+    assert hyb["reranked"] is False
+    sem = await call(client, "search_notes", query="kafka partitions", mode="semantic")
+    assert sem["mode"] == "semantic" and sem["hits"][0]["id"] == a["id"]
     kw = await call(client, "search_notes", query="kafka", mode="keyword")
     assert kw["mode"] == "keyword" and [h["id"] for h in kw["hits"]] == [a["id"]]
 
@@ -143,3 +146,23 @@ async def test_semantic_disabled_server():
         assert res["mode"] == "keyword" and "disabled" in res["notice"]
         r = await c.call_tool("find_similar", {"note_id": 1})
         assert r.is_error
+
+
+async def test_hybrid_with_reranker():
+    async with Client(create_server(KnowledgeStore(embedder=HashingEmbedder()), reranker=OverlapReranker())) as c:
+        await call(c, "add_note", title="Kafka retention", body="retention.ms deletes old segments")
+        res = await call(c, "search_notes", query="kafka retention")
+        assert res["mode"] == "hybrid" and res["reranked"] is True and res["hits"][0]["title"] == "Kafka retention"
+
+
+class BrokenReranker(OverlapReranker):
+    def score(self, query, documents):
+        raise RuntimeError("reranker model missing")
+
+
+async def test_reranker_failure_keeps_fused_results_with_notice():
+    async with Client(create_server(KnowledgeStore(embedder=HashingEmbedder()), reranker=BrokenReranker())) as c:
+        await call(c, "add_note", title="still found")
+        res = await call(c, "search_notes", query="still found")
+        assert res["mode"] == "hybrid" and res["reranked"] is False and res["hits"]
+        assert "Re-ranker unavailable" in res["notice"]

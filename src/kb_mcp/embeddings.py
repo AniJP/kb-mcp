@@ -102,3 +102,46 @@ def chunk_text(title: str, body: str, max_words: int = 180, overlap: int = 40) -
         if start + max_words >= len(words):
             break
     return chunks
+
+
+# --------------------------------------------------------------------------- re-ranking (Phase 3)
+
+DEFAULT_RERANKER = "Xenova/ms-marco-MiniLM-L-6-v2"
+
+
+class Reranker(Protocol):
+    name: str
+
+    def score(self, query: str, documents: list[str]) -> list[float]: ...
+
+
+class FastEmbedReranker:
+    """Cross-encoder: reads the query and a candidate *together* and scores how well it answers.
+
+    Much more accurate than comparing two independent vectors, but far slower, so it only ever
+    re-orders the top few candidates that cheaper search already found (~80 MB model, local).
+    """
+
+    def __init__(self, model: str = DEFAULT_RERANKER, cache_dir: str | Path | None = None):
+        self.name = model
+        self.cache_dir = str(Path(cache_dir or os.environ.get("KB_MODEL_DIR", "~/.kb-mcp/models")).expanduser())
+        self._model = None
+
+    def score(self, query: str, documents: list[str]) -> list[float]:
+        if not documents:
+            return []
+        if self._model is None:
+            from fastembed.rerank.cross_encoder import TextCrossEncoder
+
+            self._model = TextCrossEncoder(model_name=self.name, cache_dir=self.cache_dir)
+        return [float(s) for s in self._model.rerank(query, documents)]
+
+
+class OverlapReranker:
+    """Test double: score = number of distinct query words present in the document."""
+
+    name = "test-overlap"
+
+    def score(self, query: str, documents: list[str]) -> list[float]:
+        q = set(re.findall(r"\w+", query.lower()))
+        return [float(len(q & set(re.findall(r"\w+", d.lower())))) for d in documents]

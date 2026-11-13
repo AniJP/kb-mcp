@@ -25,7 +25,7 @@ from mcp.server.mcpserver.prompts.base import UserMessage
 from mcp_types import ToolAnnotations
 from pydantic import BaseModel, Field
 
-from kb_mcp.embeddings import FastEmbedEmbedder
+from kb_mcp.embeddings import FastEmbedEmbedder, FastEmbedReranker, Reranker
 from kb_mcp.store import KnowledgeStore, Note, NoteNotFound, SearchHit
 
 log = logging.getLogger(__name__)
@@ -33,7 +33,8 @@ log = logging.getLogger(__name__)
 INSTRUCTIONS = """\
 A personal knowledge base of notes and bookmarks.
 - Use search_notes before answering questions about things the user saved; cite note ids.
-  The default (semantic) mode matches by meaning; use mode="keyword" for exact names, codes or quotes.
+  The default (hybrid) mode combines meaning and exact words; use mode="keyword" for exact names,
+  codes or quotes only.
 - Use find_similar to explore notes related to one the user is looking at.
 - Use add_note / save_bookmark only when the user asks to save something.
 - delete_note is permanent: confirm with the user first.
@@ -74,9 +75,10 @@ class Hit(BaseModel):
 
 class SearchResult(BaseModel):
     query: str
-    mode: Literal["semantic", "keyword"] = Field(description="The search mode actually used")
+    mode: Literal["hybrid", "semantic", "keyword"] = Field(description="The search mode actually used")
+    reranked: bool = Field(False, description="Whether a cross-encoder re-ordered the top results")
     hits: list[Hit]
-    notice: str | None = Field(None, description="Set when semantic search was unavailable and keyword was used")
+    notice: str | None = Field(None, description="Set when the requested mode was unavailable and a fallback was used")
 
 
 class SimilarResult(BaseModel):
@@ -118,8 +120,8 @@ def _not_found(e: NoteNotFound) -> ToolError:
     return ToolError(f"No note with id {e.note_id}. Use search_notes or list_notes to find the right id.")
 
 
-def create_server(store: KnowledgeStore) -> MCPServer:
-    mcp = MCPServer(name="knowledge-base", version="0.2.0", instructions=INSTRUCTIONS)
+def create_server(store: KnowledgeStore, reranker: Reranker | None = None) -> MCPServer:
+    mcp = MCPServer(name="knowledge-base", version="0.3.0", instructions=INSTRUCTIONS)
 
     # ----------------------------------------------------------------- tools: read
 
@@ -129,23 +131,36 @@ def create_server(store: KnowledgeStore) -> MCPServer:
         tag: Annotated[str | None, Field(description="Only search notes with this tag")] = None,
         limit: Annotated[int, Field(ge=1, le=50)] = 10,
         mode: Annotated[
-            Literal["semantic", "keyword"],
-            Field(description="semantic: match by meaning (default). keyword: exact words, ranked by BM25."),
-        ] = "semantic",
+            Literal["hybrid", "semantic", "keyword"],
+            Field(description="hybrid (default): meaning + exact words combined. semantic: meaning only. "
+                              "keyword: exact words only, ranked by BM25."),
+        ] = "hybrid",
     ) -> SearchResult:
         """Search notes and bookmarks, best matches first."""
         notice = None
         try:
-            if mode == "semantic" and store.embedder is not None:
+            if mode != "keyword" and store.embedder is not None:
                 try:
-                    return SearchResult(query=query, mode="semantic",
-                                        hits=_hits(store.semantic_search(query, tag=tag, limit=limit)))
+                    if mode == "semantic":
+                        return SearchResult(query=query, mode="semantic",
+                                            hits=_hits(store.semantic_search(query, tag=tag, limit=limit)))
+                    if reranker is not None:
+                        try:
+                            hits = store.hybrid_search(query, tag=tag, limit=limit, reranker=reranker)
+                            return SearchResult(query=query, mode="hybrid", reranked=True, hits=_hits(hits))
+                        except ValueError:
+                            raise
+                        except Exception as e:  # noqa: BLE001 - re-ranker unavailable: keep fused order
+                            log.warning("re-ranking failed, using fused order: %s", e)
+                            notice = f"Re-ranker unavailable ({type(e).__name__}); results are not re-ranked."
+                    hits = store.hybrid_search(query, tag=tag, limit=limit)
+                    return SearchResult(query=query, mode="hybrid", hits=_hits(hits), notice=notice)
                 except ValueError:
                     raise
-                except Exception as e:  # noqa: BLE001 - model unavailable: degrade to keyword, say so
-                    log.warning("semantic search failed, falling back to keyword: %s", e)
-                    notice = f"Semantic search unavailable ({type(e).__name__}); showing keyword results."
-            elif mode == "semantic":
+                except Exception as e:  # noqa: BLE001 - embedding model unavailable: degrade to keyword, say so
+                    log.warning("%s search failed, falling back to keyword: %s", mode, e)
+                    notice = f"{mode.capitalize()} search unavailable ({type(e).__name__}); showing keyword results."
+            elif mode != "keyword":
                 notice = "Semantic search is disabled on this server; showing keyword results."
             return SearchResult(query=query, mode="keyword", hits=_hits(store.search(query, tag=tag, limit=limit)),
                                 notice=notice)
@@ -319,7 +334,7 @@ def main() -> None:
     kb-mcp                 serve over stdio (what Claude Desktop runs)
     kb-mcp --http          serve over Streamable HTTP
     kb-mcp reindex         embed any notes missing embeddings (also downloads the model once)
-    kb-mcp eval            compare keyword vs semantic retrieval on the bundled test set
+    kb-mcp eval            compare keyword, semantic, hybrid and re-ranked retrieval on the bundled test set
     """
     import argparse
 
@@ -327,6 +342,7 @@ def main() -> None:
     parser.add_argument("command", nargs="?", default="serve", choices=["serve", "reindex", "eval"])
     parser.add_argument("--db", default=os.environ.get("KB_DB_PATH", "~/.kb-mcp/kb.db"), help="SQLite file")
     parser.add_argument("--no-semantic", action="store_true", help="keyword search only (no embedding model)")
+    parser.add_argument("--rerank", action="store_true", help="re-order hybrid results with a cross-encoder")
     parser.add_argument("--http", action="store_true", help="serve Streamable HTTP instead of stdio")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
@@ -344,7 +360,8 @@ def main() -> None:
         print(f"embedded {n} note(s) with {store.embedder.name if store.embedder else 'no model'}")
         return
 
-    server = create_server(store)
+    reranker = FastEmbedReranker() if args.rerank and not args.no_semantic else None
+    server = create_server(store, reranker=reranker)
     if args.http:
         server.run(transport="streamable-http", host=args.host, port=args.port)
     else:

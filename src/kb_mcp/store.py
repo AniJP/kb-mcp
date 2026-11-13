@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-from kb_mcp.embeddings import Embedder, chunk_text
+from kb_mcp.embeddings import Embedder, Reranker, chunk_text
 
 log = logging.getLogger(__name__)
 
@@ -70,6 +70,17 @@ create trigger if not exists notes_au after update on notes begin
 end;
 """
 
+# Function words. In a small personal corpus they are *rare*, so BM25 gives them a high IDF and
+# lets "my" or "how" decide rankings. Dropped from any-term queries only (all-term queries keep
+# every word, because there they only narrow results).
+STOPWORDS = frozenset(
+    """a about after again all am an and any are as at be been before being but by can could did do
+    does doing for from get got had has have having how i if in into is it its just me more most my
+    no not now of on once only or other our out over own same should so some such than that the
+    their them then there these they this those through to too under until up very was we were what
+    when where which while who why will with would you your""".split()
+)
+
 _TAG_RE = re.compile(r"^[a-z0-9][a-z0-9\-_/]{0,49}$")
 
 
@@ -111,18 +122,22 @@ def normalize_tags(tags: list[str] | None) -> list[str]:
     return sorted(out)
 
 
-def _fts_query(text: str) -> str:
-    """Turn free text into a safe FTS5 query: every word must match, last word as a prefix.
+def _fts_query(text: str, any_terms: bool = False) -> str:
+    """Turn free text into a safe FTS5 query, last word as a prefix.
 
+    By default every word must match (precise). With any_terms=True any word may match and
+    BM25 sorts out the ranking (higher recall, used as one input to hybrid search).
     Quoting each token means user input can never be parsed as FTS5 syntax (no injection,
     no syntax errors from stray quotes or operators).
     """
     tokens = re.findall(r"\w+", text.lower())
+    if any_terms:
+        tokens = [t for t in tokens if t not in STOPWORDS] or tokens
     if not tokens:
         return ""
     quoted = [f'"{t}"' for t in tokens]
     quoted[-1] += "*"
-    return " ".join(quoted)
+    return (" OR " if any_terms else " ").join(quoted)
 
 
 def _trim(text: str, query: str = "", words: int = 30) -> str:
@@ -215,9 +230,9 @@ class KnowledgeStore:
         ).fetchall()
         return self._to_notes(rows), total
 
-    def search(self, query: str, tag: str | None = None, limit: int = 10) -> list[SearchHit]:
+    def search(self, query: str, tag: str | None = None, limit: int = 10, any_terms: bool = False) -> list[SearchHit]:
         """Keyword search ranked by BM25 (title matches weigh 3x body matches)."""
-        fts = _fts_query(query)
+        fts = _fts_query(query, any_terms)
         if not fts:
             return []
         args: list[object] = [fts]
@@ -418,6 +433,46 @@ class KnowledgeStore:
             return []
         sims = matrix @ self.embedder.embed_query(query)
         return self._rank_notes(sims, ids, texts, self._ids_with_tag(tag), None, limit, query)
+
+    def hybrid_search(
+        self,
+        query: str,
+        tag: str | None = None,
+        limit: int = 10,
+        reranker: Reranker | None = None,
+        candidates: int = 30,
+        rrf_k: int = 60,
+        rerank_top: int = 20,
+        keyword_weight: float = 1.0,
+    ) -> list[SearchHit]:
+        """Keyword + semantic results merged with Reciprocal Rank Fusion, optionally re-ranked.
+
+        RRF scores each note by sum(1 / (rrf_k + rank)) over the two ranked lists. It uses ranks,
+        not raw scores, so BM25 and cosine (which live on different scales) never need
+        calibrating against each other. A note ranked well by either method rises; one ranked
+        well by both rises most. `keyword_weight` scales the keyword list's contribution.
+        A cross-encoder can then re-order the top `rerank_top`.
+        """
+        if self.embedder is None:
+            raise RuntimeError("hybrid search needs an embedder")
+        keyword = self.search(query, tag=tag, limit=candidates, any_terms=True)
+        semantic = self.semantic_search(query, tag=tag, limit=candidates)
+        fused: dict[int, float] = {}
+        best: dict[int, SearchHit] = {}
+        for ranked, weight in ((semantic, 1.0), (keyword, keyword_weight)):  # semantic first: keeps its snippets
+            for rank, hit in enumerate(ranked, start=1):
+                fused[hit.note.id] = fused.get(hit.note.id, 0.0) + weight / (rrf_k + rank)
+                best.setdefault(hit.note.id, hit)
+        order = sorted(fused, key=lambda nid: -fused[nid])
+        hits = [SearchHit(best[nid].note, round(fused[nid], 5), best[nid].snippet) for nid in order]
+        if reranker is not None and hits:
+            head, tail = hits[:rerank_top], hits[rerank_top:]
+            docs = [f"{h.note.title}\n{h.note.body[:2000]}" for h in head]
+            scores = reranker.score(query, docs)
+            head = [SearchHit(h.note, round(sc, 4), h.snippet)
+                    for sc, h in sorted(zip(scores, head, strict=True), key=lambda p: -p[0])]
+            hits = head + tail
+        return hits[:limit]
 
     def similar(self, note_id: int, limit: int = 5) -> list[SearchHit]:
         """Notes closest in meaning to `note_id` (its chunks averaged into one vector)."""

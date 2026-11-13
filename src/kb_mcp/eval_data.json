@@ -1,5 +1,5 @@
 {
- "description": "Small hand-labelled retrieval set. Notes are written like real personal notes; queries are what someone might ask weeks later. 'paraphrase' queries share almost no words with the note they should find; 'exact' queries use a specific name or term from the note.",
+ "description": "Hand-labelled retrieval set. Notes are written like real personal notes; queries are what someone might ask weeks later. Query types: 'paraphrase' shares almost no words with the target note; 'exact' uses a specific term from it; 'identifier' looks up a code, number or flag (hard for embeddings); 'fine-grained' must pick one note out of several near-duplicates on the same topic (hard for everything).",
  "notes": [
   {
    "key": "duckdb-union",
@@ -257,6 +257,166 @@
    "tags": [
     "money"
    ]
+  },
+  {
+   "key": "kafka-retention",
+   "title": "Kafka retention",
+   "body": "Topics delete old segments after retention.ms (7 days by default) or when retention.bytes is exceeded, whether or not anyone consumed them. Compacted topics keep the latest value per key instead.",
+   "tags": [
+    "streaming"
+   ]
+  },
+  {
+   "key": "kafka-eos",
+   "title": "Kafka exactly-once",
+   "body": "Enable idempotent producers and transactions, and set consumers to read_committed. End-to-end exactly-once only holds if the sink is transactional or idempotent too.",
+   "tags": [
+    "streaming"
+   ]
+  },
+  {
+   "key": "kafka-lag",
+   "title": "Monitoring consumer lag",
+   "body": "Lag is the gap between the latest offset and the group's committed offset. Alert on lag that keeps growing, not on a single spike after a deploy.",
+   "tags": [
+    "streaming"
+   ]
+  },
+  {
+   "key": "dbt-snapshots",
+   "title": "dbt snapshots",
+   "body": "Snapshots record how a mutable source row changed over time (type 2 slowly changing dimension) using either a timestamp or a check strategy.",
+   "tags": [
+    "dbt"
+   ]
+  },
+  {
+   "key": "dbt-tests",
+   "title": "dbt data tests",
+   "body": "Generic tests like unique, not_null and relationships live in YAML; singular tests are SQL files that should return zero rows. Set severity warn for soft checks.",
+   "tags": [
+    "dbt"
+   ]
+  },
+  {
+   "key": "dbt-unit",
+   "title": "dbt unit tests",
+   "body": "Unit tests feed fixed input rows to one model and compare against expected rows, so logic is checked without touching real data. Every expected row needs the same columns.",
+   "tags": [
+    "dbt"
+   ]
+  },
+  {
+   "key": "airflow-sensors",
+   "title": "Airflow sensors",
+   "body": "Sensors wait for a condition such as a file landing. Use mode=reschedule or deferrable operators so a waiting sensor does not hold a worker slot for hours.",
+   "tags": [
+    "airflow"
+   ]
+  },
+  {
+   "key": "airflow-backfill",
+   "title": "Airflow backfills",
+   "body": "catchup=True schedules every missed interval since start_date. For one-off history loads run a backfill for an explicit date range instead of flipping catchup on.",
+   "tags": [
+    "airflow"
+   ]
+  },
+  {
+   "key": "pg-index-types",
+   "title": "Postgres index types",
+   "body": "B-tree for equality and ranges, GIN for jsonb and full-text, BRIN for huge append-only tables ordered by time.",
+   "tags": [
+    "sql"
+   ]
+  },
+  {
+   "key": "embeddings-models",
+   "title": "Choosing an embedding model",
+   "body": "Small models like bge-small (384 dimensions) run on a laptop and are good enough for personal search. Check the MTEB leaderboard for the task, not the overall average.",
+   "tags": [
+    "llm"
+   ]
+  },
+  {
+   "key": "rag-eval",
+   "title": "Evaluating retrieval",
+   "body": "Build a labelled set of queries and relevant documents, then track recall@k and MRR. Include hard cases or every method looks perfect.",
+   "tags": [
+    "llm"
+   ]
+  },
+  {
+   "key": "exit-137",
+   "title": "Container killed with exit code 137",
+   "body": "137 means the process got SIGKILL, almost always the out-of-memory killer. Raise the memory limit or stream the data instead of loading it all.",
+   "tags": [
+    "docker"
+   ]
+  },
+  {
+   "key": "pg-23505",
+   "title": "Postgres error 23505",
+   "body": "unique_violation: an insert hit an existing key. Use INSERT ... ON CONFLICT DO NOTHING or DO UPDATE to make the load idempotent.",
+   "tags": [
+    "sql"
+   ]
+  },
+  {
+   "key": "http-429",
+   "title": "Handling HTTP 429 from APIs",
+   "body": "Too Many Requests: back off exponentially with jitter and honour the Retry-After header. Cache responses so reruns do not hit the API again.",
+   "tags": [
+    "python"
+   ]
+  },
+  {
+   "key": "ruff-b905",
+   "title": "ruff B905",
+   "body": "zip() without strict= silently truncates when lists differ in length. Add strict=True so a mismatch raises instead.",
+   "tags": [
+    "python"
+   ]
+  },
+  {
+   "key": "pep-668",
+   "title": "externally-managed-environment error",
+   "body": "PEP 668 stops pip installing into the system Python. Use a virtual environment; --break-system-packages is the escape hatch for throwaway containers only.",
+   "tags": [
+    "python"
+   ]
+  },
+  {
+   "key": "port-8765",
+   "title": "Local MCP server over HTTP",
+   "body": "kb-mcp --http serves Streamable HTTP on 127.0.0.1:8765 at the /mcp path. Bind to localhost unless you add authentication.",
+   "tags": [
+    "mcp"
+   ]
+  },
+  {
+   "key": "cron-expr",
+   "title": "Cron schedule cheat sheet",
+   "body": "0 6 * * 1-5 runs at 06:00 on weekdays. */15 * * * * is every 15 minutes. The fields are minute, hour, day of month, month, day of week.",
+   "tags": [
+    "admin"
+   ]
+  },
+  {
+   "key": "git-reflog",
+   "title": "Recovering a lost commit",
+   "body": "git reflog lists where HEAD has been, including commits no branch points to any more. git reset --hard HEAD@{2} or cherry-pick the hash to get it back.",
+   "tags": [
+    "git"
+   ]
+  },
+  {
+   "key": "iso-week",
+   "title": "Week numbers in SQL",
+   "body": "Use the ISO week (isoweek, ISOYEAR) so a week never splits across years; plain week() numbering differs between databases.",
+   "tags": [
+    "sql"
+   ]
   }
  ],
  "queries": [
@@ -485,6 +645,202 @@
     "docker-layers"
    ],
    "type": "exact"
+  },
+  {
+   "q": "why did old messages disappear from my topic",
+   "relevant": [
+    "kafka-retention"
+   ],
+   "type": "fine-grained"
+  },
+  {
+   "q": "making sure each event is processed only once in the stream",
+   "relevant": [
+    "kafka-eos"
+   ],
+   "type": "fine-grained"
+  },
+  {
+   "q": "how far behind are my stream consumers",
+   "relevant": [
+    "kafka-lag"
+   ],
+   "type": "fine-grained"
+  },
+  {
+   "q": "tracking how a customer's address changed over time in the warehouse",
+   "relevant": [
+    "dbt-snapshots"
+   ],
+   "type": "fine-grained"
+  },
+  {
+   "q": "testing a model's logic with fake input rows",
+   "relevant": [
+    "dbt-unit"
+   ],
+   "type": "fine-grained"
+  },
+  {
+   "q": "checking columns are never null and unique",
+   "relevant": [
+    "dbt-tests"
+   ],
+   "type": "fine-grained"
+  },
+  {
+   "q": "task waiting for a file is hogging a worker",
+   "relevant": [
+    "airflow-sensors"
+   ],
+   "type": "fine-grained"
+  },
+  {
+   "q": "loading two years of history into a new pipeline",
+   "relevant": [
+    "airflow-backfill"
+   ],
+   "type": "fine-grained"
+  },
+  {
+   "q": "which index for a jsonb column",
+   "relevant": [
+    "pg-index-types"
+   ],
+   "type": "fine-grained"
+  },
+  {
+   "q": "which vector model should I use for personal search",
+   "relevant": [
+    "embeddings-models"
+   ],
+   "type": "fine-grained"
+  },
+  {
+   "q": "how do I know if my search results are any good",
+   "relevant": [
+    "rag-eval"
+   ],
+   "type": "fine-grained"
+  },
+  {
+   "q": "exit code 137",
+   "relevant": [
+    "exit-137"
+   ],
+   "type": "identifier"
+  },
+  {
+   "q": "23505",
+   "relevant": [
+    "pg-23505"
+   ],
+   "type": "identifier"
+  },
+  {
+   "q": "429 Retry-After",
+   "relevant": [
+    "http-429"
+   ],
+   "type": "identifier"
+  },
+  {
+   "q": "B905",
+   "relevant": [
+    "ruff-b905"
+   ],
+   "type": "identifier"
+  },
+  {
+   "q": "PEP 668",
+   "relevant": [
+    "pep-668"
+   ],
+   "type": "identifier"
+  },
+  {
+   "q": "8765",
+   "relevant": [
+    "port-8765"
+   ],
+   "type": "identifier"
+  },
+  {
+   "q": "0 6 * * 1-5",
+   "relevant": [
+    "cron-expr"
+   ],
+   "type": "identifier"
+  },
+  {
+   "q": "HEAD@{2}",
+   "relevant": [
+    "git-reflog"
+   ],
+   "type": "identifier"
+  },
+  {
+   "q": "ISOYEAR",
+   "relevant": [
+    "iso-week"
+   ],
+   "type": "identifier"
+  },
+  {
+   "q": "retention.ms",
+   "relevant": [
+    "kafka-retention"
+   ],
+   "type": "identifier"
+  },
+  {
+   "q": "read_committed",
+   "relevant": [
+    "kafka-eos"
+   ],
+   "type": "identifier"
+  },
+  {
+   "q": "my container keeps getting killed",
+   "relevant": [
+    "exit-137"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "duplicate key error when loading rows",
+   "relevant": [
+    "pg-23505"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "the API says I'm sending too many requests",
+   "relevant": [
+    "http-429"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "pip refuses to install packages globally",
+   "relevant": [
+    "pep-668"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "I deleted a branch and lost my work",
+   "relevant": [
+    "git-reflog"
+   ],
+   "type": "paraphrase"
+  },
+  {
+   "q": "run a job every weekday morning",
+   "relevant": [
+    "cron-expr"
+   ],
+   "type": "paraphrase"
   }
  ]
 }
