@@ -2,7 +2,7 @@
 
 An [MCP](https://modelcontextprotocol.io) server that gives an AI assistant a long-term memory you control: save notes and bookmarks, find them with **hybrid search** (meaning + exact words, optionally re-ranked by a cross-encoder), and pull them into a conversation. It is built from scratch on the official MCP Python SDK (v2), with SQLite storage, a local embedding model (no API key, nothing leaves your machine), and tests at the protocol level.
 
-> **Status:** Phases 1–3 (MCP fundamentals, semantic search, hybrid search + evaluation) complete. See the [roadmap](#roadmap).
+> **Status:** Phases 1–4 (MCP fundamentals, semantic search, hybrid search + evaluation, ingestion pipeline) complete. See the [roadmap](#roadmap).
 
 ## What the assistant gets
 
@@ -19,11 +19,14 @@ An [MCP](https://modelcontextprotocol.io) server that gives an AI assistant a lo
 | `save_bookmark(url, title, notes?, tags?)` | Save a link (http/https only) | write |
 | `update_note(note_id, title?, body?, tags?)` | Change only the fields given | write, idempotent |
 | `delete_note(note_id)` | Permanent delete | **destructive** |
+| `import_url(url, tags?)` | Fetch a web page, keep its readable text, save it as a note; re-importing refreshes it | write, idempotent, **open-world** |
+| `import_history(limit?)` | Recent import runs with counts and errors | read-only |
 
 **Resources**, which the user or client can attach as context:
 - `kb://notes/{note_id}`: a note rendered as Markdown
 - `kb://tags`: every tag with its note count
 - `kb://stats`: counts of notes, bookmarks and tags
+- `kb://imports`: the last 20 import runs
 
 **Prompts**, as reusable workflows:
 - `summarize_tag(tag)`: summarise everything under a topic, with citations
@@ -90,6 +93,44 @@ Every step fails soft:
 - **Re-ranking is optional** (`--rerank`). It is the best mode on near-duplicates (recall@5 1.00, MRR 0.88) but about 30× slower and no better overall.
 - **Caveat:** 60 hand-written queries is small, and the dataset was extended while this phase was being built. Treat these as directional, not definitive.
 
+## Ingestion pipeline (Phase 4)
+
+Bring in what you already have, and keep it in sync:
+
+```bash
+kb-mcp ingest folder ~/Notes            # Markdown / .txt (an Obsidian vault works as-is)
+kb-mcp ingest folder ~/Notes --prune    # ...and remove notes whose file was deleted
+kb-mcp ingest bookmarks ~/Downloads/bookmarks.html   # browser export: Chrome, Safari, Firefox, Edge
+kb-mcp ingest url https://example.com/article --tag reading
+kb-mcp runs                             # what each run added, updated, skipped or failed
+```
+
+| Source | Title | Tags | Identity (for re-runs) |
+|---|---|---|---|
+| Folder | front matter `title:` → first `# heading` → file name | front matter `tags:` + inline `#hashtags` | folder + relative path |
+| Bookmarks | link text | bookmark folder names (browser root folders skipped) | normalised URL |
+| Web page | `<title>` | given with `--tag` | normalised final URL |
+
+How the pipeline is built:
+- **Idempotent.** Each imported note is tracked by `(source type, source id)` with a content hash. A re-run updates only what changed and skips the rest. Unchanged items cost nothing, not even re-embedding.
+- **No duplicates.** URLs are normalised: lower-case host, no `#fragment`, no `utm_*`/`fbclid` tracking parameters, no trailing slash. A bookmark for a page you already saved by hand is *linked* to your note instead of copied, and your note is left untouched.
+- **Safe deletes.** `--prune` is opt-in and only removes notes that came from *that* folder. It never touches hand-written notes or other sources.
+- **Partial failure is normal.** A bad file or a page that times out is counted and logged, and the run continues. Every run is recorded in `ingest_runs` and exposed through `import_history` and `kb://imports`.
+- **SSRF-safe fetching.** `import_url` can be called by the model, so a prompt-injected page could try to make the server fetch `localhost`, a router or a cloud metadata endpoint. The fetcher therefore:
+  - allows only http(s)
+  - resolves the hostname and refuses non-public addresses, re-checking after every redirect
+  - caps pages at 2 MB with a 15-second timeout
+  - accepts only HTML or plain text
+
+  Folder and bookmark imports stay CLI-only, so the model can never read arbitrary files from your disk.
+- **Readable text only.** Scripts, styles, navigation, headers, footers and sidebars are dropped. `<article>`/`<main>` is preferred when it holds real content.
+
+**Keeping a folder in sync automatically** (macOS/Linux cron, every morning at 7:45):
+```bash
+crontab -e
+45 7 * * * /ABSOLUTE/PATH/TO/.venv/bin/kb-mcp ingest folder ~/Notes --prune >> ~/.kb-mcp/ingest.log 2>&1
+```
+
 ## Design decisions
 
 - **The storage layer knows nothing about MCP.** `store.py` is plain Python + SQLite, and `server.py` is a thin protocol layer over it. Later phases (vector search, ingestion) plug in behind the same interface.
@@ -105,7 +146,7 @@ Every step fails soft:
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest                         # 52 tests: storage, semantic + hybrid search, protocol, real stdio round-trip
+pytest                         # 72 tests: storage, search, ingestion, protocol, real stdio round-trip
 kb-mcp reindex                 # one-time: downloads the embedding model and embeds existing notes
 kb-mcp eval                    # keyword vs semantic vs hybrid vs re-ranked, by query type
 kb-mcp --rerank                # serve with cross-encoder re-ranking on
@@ -142,6 +183,7 @@ npx @modelcontextprotocol/inspector .venv/bin/kb-mcp
 |---|---|
 | `tests/test_store.py` | CRUD, tag normalisation, BM25 ranking (title > body), prefix search, index consistency after update and delete, FTS-syntax safety, persistence |
 | `tests/test_semantic.py` | Chunking, embedding on write, staleness after edits and model changes, legacy-database backfill, best-chunk ranking, tag filter, similarity, failure never losing a write, RRF fusion, identifier rescue, re-ranking, eval harness and dataset integrity |
+| `tests/test_ingest.py` | Folder parsing (front matter, headings, hashtags, hidden folders), idempotent re-runs, change detection with re-embedding, scoped prune, per-item failures, bookmark parsing, URL normalisation and dedup, readable-text extraction, SSRF guard |
 | `tests/test_server.py` | Through a real MCP client (in-process): tool schemas and annotations, structured output, error contract, input validation, pagination, resources, prompts, search modes, fallback notices |
 | `tests/test_stdio.py` | The server launched as a subprocess over stdio, the way Claude Desktop runs it |
 
@@ -152,7 +194,7 @@ npx @modelcontextprotocol/inspector .venv/bin/kb-mcp
 | 1. MCP fundamentals | Tools, resources, prompts, annotations, structured output, stdio + HTTP | ✅ |
 | 2. Semantic search | Local embeddings, chunking, vector search, `find_similar`, retrieval eval | ✅ |
 | 3. Hybrid search | BM25 + vectors with RRF, cross-encoder re-ranking, harder evaluation (identifier and near-duplicate queries) | ✅ |
-| 4. Ingestion pipeline | Import from files, web pages and bookmarks exports; chunking, dedup, scheduled refresh | |
+| 4. Ingestion pipeline | Folders, bookmark exports, web pages; idempotent upserts, URL dedup, scoped prune, run log, SSRF-safe fetching | ✅ |
 | 5. Agent memory | Memories the assistant writes itself, with recency and importance scoring | |
 
 ## Layout
@@ -160,6 +202,7 @@ npx @modelcontextprotocol/inspector .venv/bin/kb-mcp
 ```
 src/kb_mcp/store.py        SQLite storage: notes, FTS5 keyword index, embeddings (no MCP dependency)
 src/kb_mcp/embeddings.py   embedding + re-ranking models (local fastembed, offline test doubles) and chunking
+src/kb_mcp/ingest.py       ingestion: folder, bookmarks and web sources, the idempotent pipeline, SSRF guard
 src/kb_mcp/evaluate.py     retrieval evaluation (recall@5, MRR, nDCG@5, latency) on eval_data.json
 src/kb_mcp/server.py       MCP tools, resources, prompts, CLI entry point
 tests/                 storage, protocol and stdio tests

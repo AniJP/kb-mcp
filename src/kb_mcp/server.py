@@ -26,6 +26,7 @@ from mcp_types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from kb_mcp.embeddings import FastEmbedEmbedder, FastEmbedReranker, Reranker
+from kb_mcp.ingest import fetch_html, ingest_url
 from kb_mcp.store import KnowledgeStore, Note, NoteNotFound, SearchHit
 
 log = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ A personal knowledge base of notes and bookmarks.
   codes or quotes only.
 - Use find_similar to explore notes related to one the user is looking at.
 - Use add_note / save_bookmark only when the user asks to save something.
+- import_url fetches a web page into the knowledge base; use it when the user asks to save an article.
 - delete_note is permanent: confirm with the user first.
 """
 
@@ -44,6 +46,8 @@ READ = ToolAnnotations(read_only_hint=True, idempotent_hint=True, open_world_hin
 WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False)
 UPDATE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False)
 DELETE = ToolAnnotations(read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=False)
+# Fetches from the internet: open world. Re-importing the same URL refreshes one note: idempotent.
+IMPORT = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True)
 
 
 # --------------------------------------------------------------------------- result models
@@ -97,6 +101,29 @@ class TagCount(BaseModel):
     count: int
 
 
+class ImportResult(BaseModel):
+    outcome: Literal["added", "updated", "unchanged", "linked"] = Field(
+        description="added: new note. updated: page changed since last import. unchanged: same content. "
+                    "linked: the URL was already saved, nothing duplicated."
+    )
+    note: NoteOut
+
+
+class ImportRun(BaseModel):
+    id: int
+    source_type: str
+    source: str
+    started_at: str
+    finished_at: str | None
+    added: int
+    updated: int
+    unchanged: int
+    linked: int
+    pruned: int
+    failed: int
+    errors: list[str]
+
+
 class Deleted(BaseModel):
     id: int
     title: str
@@ -120,8 +147,8 @@ def _not_found(e: NoteNotFound) -> ToolError:
     return ToolError(f"No note with id {e.note_id}. Use search_notes or list_notes to find the right id.")
 
 
-def create_server(store: KnowledgeStore, reranker: Reranker | None = None) -> MCPServer:
-    mcp = MCPServer(name="knowledge-base", version="0.3.0", instructions=INSTRUCTIONS)
+def create_server(store: KnowledgeStore, reranker: Reranker | None = None, fetch=fetch_html) -> MCPServer:
+    mcp = MCPServer(name="knowledge-base", version="0.4.0", instructions=INSTRUCTIONS)
 
     # ----------------------------------------------------------------- tools: read
 
@@ -261,6 +288,28 @@ def create_server(store: KnowledgeStore, reranker: Reranker | None = None) -> MC
             raise _not_found(e) from e
         return Deleted(id=n.id, title=n.title)
 
+    # ----------------------------------------------------------------- tools: ingestion
+
+    @mcp.tool(title="Import a web page", annotations=IMPORT)
+    def import_url(
+        url: Annotated[str, Field(description="Public http(s) page to save, e.g. an article or docs page")],
+        tags: Tags | None = None,
+    ) -> ImportResult:
+        """Fetch a web page, keep its readable text, and save it as a note (searchable like any other).
+
+        Importing the same URL again refreshes that note instead of creating a duplicate.
+        """
+        report = ingest_url(store, url, tags, fetch=fetch)
+        if report.counts["failed"]:
+            raise ToolError(f"Could not import {url}: {report.errors[0].split(': ', 1)[-1]}")
+        outcome = next(k for k in ("added", "updated", "unchanged", "linked") if report.counts[k])
+        return ImportResult(outcome=outcome, note=NoteOut.of(store.get(report.note_ids[0])))
+
+    @mcp.tool(title="Import history", annotations=READ)
+    def import_history(limit: Annotated[int, Field(ge=1, le=50)] = 10) -> list[ImportRun]:
+        """Recent import runs (folders, bookmark files, web pages) with what each added or changed."""
+        return [ImportRun(**r) for r in store.recent_runs(limit)]
+
     # ----------------------------------------------------------------- resources
 
     @mcp.resource("kb://notes/{note_id}", name="note", title="Note", mime_type="text/markdown")
@@ -282,6 +331,11 @@ def create_server(store: KnowledgeStore, reranker: Reranker | None = None) -> MC
     def tags_resource() -> str:
         """Every tag with its note count."""
         return json.dumps([{"tag": t, "count": n} for t, n in store.tags()])
+
+    @mcp.resource("kb://imports", name="imports", title="Import history", mime_type="application/json")
+    def imports_resource() -> str:
+        """The last 20 import runs."""
+        return json.dumps(store.recent_runs(20))
 
     @mcp.resource("kb://stats", name="stats", title="Knowledge base stats", mime_type="application/json")
     def stats_resource() -> str:
@@ -335,11 +389,19 @@ def main() -> None:
     kb-mcp --http          serve over Streamable HTTP
     kb-mcp reindex         embed any notes missing embeddings (also downloads the model once)
     kb-mcp eval            compare keyword, semantic, hybrid and re-ranked retrieval on the bundled test set
+    kb-mcp ingest folder PATH [--prune]   import Markdown/text notes (re-run any time; only changes apply)
+    kb-mcp ingest bookmarks FILE          import a browser bookmarks export (.html)
+    kb-mcp ingest url URL [--tag T]       import one web page
+    kb-mcp runs                           show recent import runs
     """
     import argparse
 
     parser = argparse.ArgumentParser(description="Personal knowledge-base MCP server")
-    parser.add_argument("command", nargs="?", default="serve", choices=["serve", "reindex", "eval"])
+    parser.add_argument("command", nargs="?", default="serve", choices=["serve", "reindex", "eval", "ingest", "runs"])
+    parser.add_argument("target", nargs="*", help="for ingest: folder PATH | bookmarks FILE | url URL")
+    parser.add_argument("--prune", action="store_true",
+                        help="ingest folder: delete notes whose file was removed (only notes from that folder)")
+    parser.add_argument("--tag", action="append", default=[], help="ingest url: tag to add (repeatable)")
     parser.add_argument("--db", default=os.environ.get("KB_DB_PATH", "~/.kb-mcp/kb.db"), help="SQLite file")
     parser.add_argument("--no-semantic", action="store_true", help="keyword search only (no embedding model)")
     parser.add_argument("--rerank", action="store_true", help="re-order hybrid results with a cross-encoder")
@@ -358,6 +420,28 @@ def main() -> None:
     if args.command == "reindex":
         n = store.reindex()
         print(f"embedded {n} note(s) with {store.embedder.name if store.embedder else 'no model'}")
+        return
+    if args.command == "runs":
+        for r in store.recent_runs(10):
+            counts = ", ".join(f"{k} {r[k]}" for k in ("added", "updated", "unchanged", "linked", "pruned", "failed")
+                               if r[k])
+            print(f"#{r['id']:<4} {r['started_at']}  {r['source_type']:<9} {r['source']}  {counts or 'no changes'}")
+        return
+    if args.command == "ingest":
+        from kb_mcp import ingest
+
+        if len(args.target) != 2 or args.target[0] not in ("folder", "bookmarks", "url"):
+            parser.error("usage: kb-mcp ingest {folder PATH | bookmarks FILE | url URL}")
+        kind, where = args.target
+        if kind == "folder":
+            report = ingest.ingest_folder(store, where, prune=args.prune)
+        elif kind == "bookmarks":
+            report = ingest.ingest_bookmarks(store, where)
+        else:
+            report = ingest.ingest_url(store, where, args.tag)
+        print(report.summary())
+        for err in report.errors[:10]:
+            print(f"  ! {err}")
         return
 
     reranker = FastEmbedReranker() if args.rerank and not args.no_semantic else None

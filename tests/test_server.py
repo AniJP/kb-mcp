@@ -30,8 +30,10 @@ async def test_tools_are_listed_with_schemas_and_annotations(client):
     assert set(tools) == {
         "search_notes", "get_note", "list_notes", "list_tags",
         "add_note", "save_bookmark", "update_note", "delete_note", "find_similar",
+        "import_url", "import_history",
     }
-    for name in ("search_notes", "get_note", "list_notes", "list_tags", "find_similar"):
+    assert tools["import_url"].annotations.open_world_hint is True
+    for name in ("search_notes", "get_note", "list_notes", "list_tags", "find_similar", "import_history"):
         assert tools[name].annotations.read_only_hint is True
     assert tools["delete_note"].annotations.destructive_hint is True
     assert tools["update_note"].annotations.idempotent_hint is True
@@ -166,3 +168,39 @@ async def test_reranker_failure_keeps_fused_results_with_notice():
         res = await call(c, "search_notes", query="still found")
         assert res["mode"] == "hybrid" and res["reranked"] is False and res["hits"]
         assert "Re-ranker unavailable" in res["notice"]
+
+
+PAGE = """<html><head><title>Kafka retention explained</title></head><body>
+<nav>Home | Blog | About</nav><article><h1>Kafka retention</h1>
+<p>Topics delete old segments after retention.ms whether or not anyone read them.</p>
+<p>""" + "Compacted topics keep the latest value per key instead. " * 10 + """</p></article>
+<footer>Copyright</footer><script>track()</script></body></html>"""
+
+
+async def test_import_url_tool_is_idempotent_and_dedups():
+    fetched = []
+
+    def fake_fetch(url):
+        fetched.append(url)
+        return url, PAGE
+
+    store = KnowledgeStore(embedder=HashingEmbedder())
+    async with Client(create_server(store, fetch=fake_fetch)) as c:
+        first = await call(c, "import_url", url="https://blog.example.com/kafka?utm_source=x", tags=["kafka"])
+        assert first["outcome"] == "added"
+        assert first["note"]["title"] == "Kafka retention explained"
+        assert first["note"]["url"] == "https://blog.example.com/kafka"
+        assert "Copyright" not in first["note"]["body"] and "track()" not in first["note"]["body"]
+        again = await call(c, "import_url", url="https://blog.example.com/kafka")
+        assert again["outcome"] in ("unchanged", "updated") and again["note"]["id"] == first["note"]["id"]
+        found = await call(c, "search_notes", query="retention.ms")
+        assert found["hits"][0]["id"] == first["note"]["id"]
+        runs = await call(c, "import_history")
+        assert len(runs["result"]) == 2 and runs["result"][0]["source_type"] == "web"
+
+
+async def test_import_url_refuses_private_addresses():
+    async with Client(create_server(KnowledgeStore())) as c:
+        for url in ("http://localhost:8765/mcp", "http://169.254.169.254/latest/meta-data", "file:///etc/passwd"):
+            r = await c.call_tool("import_url", {"url": url})
+            assert r.is_error, url

@@ -23,7 +23,7 @@ from kb_mcp.embeddings import Embedder, Reranker, chunk_text
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 create table if not exists notes (
@@ -62,6 +62,34 @@ create table if not exists note_chunks (
     content_hash  text not null,
     embedding     blob not null,
     primary key (note_id, chunk_index)
+);
+
+-- Phase 4: where an imported note came from. (source_type, source_id) identifies the item in its
+-- origin (a file path, a normalised URL), so re-importing updates the same note instead of
+-- duplicating it; content_hash makes unchanged items a no-op.
+create table if not exists note_sources (
+    note_id       integer not null references notes(id) on delete cascade,
+    source_type   text not null,
+    source_id     text not null,
+    content_hash  text not null,
+    last_run_id   integer,
+    primary key (source_type, source_id)
+);
+create index if not exists note_sources_note on note_sources(note_id);
+
+create table if not exists ingest_runs (
+    id           integer primary key autoincrement,
+    source_type  text not null,
+    source       text not null,
+    started_at   text not null,
+    finished_at  text,
+    added        integer not null default 0,
+    updated      integer not null default 0,
+    unchanged    integer not null default 0,
+    linked       integer not null default 0,
+    pruned       integer not null default 0,
+    failed       integer not null default 0,
+    errors       text not null default '[]'
 );
 
 create trigger if not exists notes_au after update on notes begin
@@ -319,6 +347,89 @@ class KnowledgeStore:
         updated = self.get(note_id)
         self._embed_quietly(note_id, updated.title, updated.body)
         return updated
+
+    # ------------------------------------------------------------------ ingestion (Phase 4)
+
+    def find_by_url(self, url: str) -> Note | None:
+        row = self._conn.execute("select * from notes where url = ? order by id limit 1", (url,)).fetchone()
+        return self._to_notes([row])[0] if row else None
+
+    def upsert_from_source(
+        self,
+        source_type: str,
+        source_id: str,
+        title: str,
+        body: str,
+        tags: list[str] | None = None,
+        url: str | None = None,
+        run_id: int | None = None,
+    ) -> tuple[str, int]:
+        """Create or refresh the note for one source item. Returns (outcome, note_id).
+
+        outcome is one of:
+          added      new item, new note
+          updated    known item whose content changed
+          unchanged  known item, same content (no write, no re-embedding)
+          linked     new item whose URL already exists as a note (e.g. saved by hand):
+                     the source is attached to that note instead of creating a duplicate
+        """
+        digest = _content_hash(title, f"{body}\n{url or ''}\n{','.join(normalize_tags(tags))}")
+        row = self._conn.execute(
+            "select note_id, content_hash from note_sources where source_type = ? and source_id = ?",
+            (source_type, source_id),
+        ).fetchone()
+        if row is not None:
+            with self._tx() as c:
+                c.execute("update note_sources set last_run_id = ? where source_type = ? and source_id = ?",
+                          (run_id, source_type, source_id))
+            if row["content_hash"] == digest:
+                return "unchanged", row["note_id"]
+            self.update(row["note_id"], title=title, body=body, tags=tags, url=url)
+            with self._tx() as c:
+                c.execute("update note_sources set content_hash = ? where source_type = ? and source_id = ?",
+                          (digest, source_type, source_id))
+            return "updated", row["note_id"]
+
+        existing = self.find_by_url(url) if url else None
+        if existing is not None:
+            outcome, note_id = "linked", existing.id
+        else:
+            outcome, note_id = "added", self.add(title, body, tags, url=url).id
+        with self._tx() as c:
+            c.execute("insert into note_sources values (?, ?, ?, ?, ?)",
+                      (note_id, source_type, source_id, digest, run_id))
+        return outcome, note_id
+
+    def source_ids(self, source_type: str, prefix: str = "") -> dict[str, int]:
+        """source_id -> note_id for one source type, optionally limited to ids starting with `prefix`."""
+        rows = self._conn.execute(
+            "select source_id, note_id from note_sources where source_type = ?", (source_type,)
+        ).fetchall()
+        return {r["source_id"]: r["note_id"] for r in rows if r["source_id"].startswith(prefix)}
+
+    def start_run(self, source_type: str, source: str) -> int:
+        with self._tx() as c:
+            cur = c.execute("insert into ingest_runs (source_type, source, started_at) values (?, ?, ?)",
+                            (source_type, source, _now()))
+        return cur.lastrowid
+
+    def finish_run(self, run_id: int, counts: dict[str, int], errors: list[str]) -> None:
+        import json
+
+        with self._tx() as c:
+            c.execute(
+                """update ingest_runs set finished_at = ?, added = ?, updated = ?, unchanged = ?, linked = ?,
+                   pruned = ?, failed = ?, errors = ? where id = ?""",
+                (_now(), counts.get("added", 0), counts.get("updated", 0), counts.get("unchanged", 0),
+                 counts.get("linked", 0), counts.get("pruned", 0), counts.get("failed", 0),
+                 json.dumps(errors[:50]), run_id),
+            )
+
+    def recent_runs(self, limit: int = 10) -> list[dict]:
+        import json
+
+        rows = self._conn.execute("select * from ingest_runs order by id desc limit ?", (limit,)).fetchall()
+        return [{**dict(r), "errors": json.loads(r["errors"])} for r in rows]
 
     def delete(self, note_id: int) -> Note:
         note = self.get(note_id)
