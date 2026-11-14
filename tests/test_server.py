@@ -31,7 +31,10 @@ async def test_tools_are_listed_with_schemas_and_annotations(client):
         "search_notes", "get_note", "list_notes", "list_tags",
         "add_note", "save_bookmark", "update_note", "delete_note", "find_similar",
         "import_url", "import_history",
+        "remember", "recall", "list_memories", "review_memories", "forget",
     }
+    assert tools["forget"].annotations.destructive_hint is True
+    assert tools["recall"].annotations.read_only_hint is True
     assert tools["import_url"].annotations.open_world_hint is True
     for name in ("search_notes", "get_note", "list_notes", "list_tags", "find_similar", "import_history"):
         assert tools[name].annotations.read_only_hint is True
@@ -93,7 +96,7 @@ async def test_resources(client):
     text = (await client.read_resource(f"kb://notes/{n['id']}")).contents[0].text
     assert text.startswith("# Resource me") and "`t`" in text
     stats = json.loads((await client.read_resource("kb://stats")).contents[0].text)
-    assert stats == {"notes": 1, "bookmarks": 0, "tags": 1, "embedded_chunks": 1}
+    assert stats == {"notes": 1, "bookmarks": 0, "tags": 1, "embedded_chunks": 1, "memories": 0}
     with pytest.raises(MCPError):
         await client.read_resource("kb://notes/999")
 
@@ -101,7 +104,7 @@ async def test_resources(client):
 async def test_prompts(client):
     await call(client, "add_note", title="Kafka", body="consumer groups", tags=["streaming"])
     names = {p.name for p in (await client.list_prompts()).prompts}
-    assert names == {"summarize_tag", "find_related"}
+    assert names == {"summarize_tag", "find_related", "start_with_memory"}
     msg = (await client.get_prompt("summarize_tag", {"tag": "streaming"})).messages[0].content.text
     assert "[1] Kafka" in msg and "cite note ids" in msg
 

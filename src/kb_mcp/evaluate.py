@@ -137,3 +137,52 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# --------------------------------------------------------------------------- memory thresholds (Phase 5)
+
+MEMORY_PAIRS = [
+    # (a, b, relation): same = one fact reworded; conflict = the fact changed; unrelated
+    ("Prefers concise answers", "Likes short, concise replies", "same"),
+    ("Applying for data engineering jobs", "Is job hunting for data engineer roles", "same"),
+    ("Uses Python for most projects", "Writes most of their code in Python", "same"),
+    ("Lives in Virginia", "Lives in Maryland", "conflict"),
+    ("Prefers concise answers", "Prefers detailed explanations", "conflict"),
+    ("Uses DuckDB for analytics", "Uses Postgres for analytics", "conflict"),
+    ("Working on the NBA data platform", "Working on the Olist delivery project", "unrelated"),
+    ("Has a dog named Max", "Likes hiking on weekends", "unrelated"),
+]
+
+
+def memory_thresholds(embedder: Embedder | None = None) -> list[dict]:
+    """Cosine similarity of hand-picked memory pairs against the review threshold.
+
+    'same' and 'conflict' pairs must both be surfaced for review (only the assistant can tell them
+    apart); 'unrelated' pairs must not be.
+    """
+    from kb_mcp.memory import SIMILAR_THRESHOLD
+
+    embedder = embedder or FastEmbedEmbedder()
+    rows = []
+    for a, b, relation in MEMORY_PAIRS:
+        va, vb = embedder.embed_documents([a, b])
+        sim = float(va @ vb)
+        rows.append({"a": a, "b": b, "similarity": sim, "relation": relation,
+                     "surfaced": sim >= SIMILAR_THRESHOLD, "should_surface": relation != "unrelated"})
+    return rows
+
+
+def print_memory_thresholds() -> None:
+    from kb_mcp.memory import SIMILAR_THRESHOLD
+
+    rows = memory_thresholds()
+    print(f"review threshold {SIMILAR_THRESHOLD} (only identical text is merged automatically)\n")
+    print(f"{'sim':>6}  {'relation':<10}{'surfaced':<10}pair")
+    for r in rows:
+        flag = "" if r["surfaced"] == r["should_surface"] else "  <-- wrong"
+        print(f"{r['similarity']:>6.3f}  {r['relation']:<10}{str(r['surfaced']):<10}{r['a']!r} / {r['b']!r}{flag}")
+    same = [r["similarity"] for r in rows if r["relation"] == "same"]
+    conflict = [r["similarity"] for r in rows if r["relation"] == "conflict"]
+    overlap = " overlapping, so similarity alone cannot decide merges" if max(conflict) >= min(same) else ""
+    print(f"\nsame-fact pairs {min(same):.2f}-{max(same):.2f}, "
+          f"conflicting pairs {min(conflict):.2f}-{max(conflict):.2f}:{overlap}")

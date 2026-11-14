@@ -1,8 +1,8 @@
 # kb-mcp — a personal knowledge-base MCP server
 
-An [MCP](https://modelcontextprotocol.io) server that gives an AI assistant a long-term memory you control: save notes and bookmarks, find them with **hybrid search** (meaning + exact words, optionally re-ranked by a cross-encoder), and pull them into a conversation. It is built from scratch on the official MCP Python SDK (v2), with SQLite storage, a local embedding model (no API key, nothing leaves your machine), and tests at the protocol level.
+An [MCP](https://modelcontextprotocol.io) server that gives an AI assistant a long-term memory you control: save notes and bookmarks, import folders and web pages, find anything with **hybrid search**, and let the assistant **remember what it learns about you** across conversations. It is built from scratch on the official MCP Python SDK (v2), with SQLite storage, a local embedding model (no API key, nothing leaves your machine), and tests at the protocol level.
 
-> **Status:** Phases 1–4 (MCP fundamentals, semantic search, hybrid search + evaluation, ingestion pipeline) complete. See the [roadmap](#roadmap).
+> **Status:** all five phases complete: MCP fundamentals, semantic search, hybrid search + evaluation, ingestion pipeline, agent memory. See the [roadmap](#roadmap).
 
 ## What the assistant gets
 
@@ -21,16 +21,23 @@ An [MCP](https://modelcontextprotocol.io) server that gives an AI assistant a lo
 | `delete_note(note_id)` | Permanent delete | **destructive** |
 | `import_url(url, tags?)` | Fetch a web page, keep its readable text, save it as a note; re-importing refreshes it | write, idempotent, **open-world** |
 | `import_history(limit?)` | Recent import runs with counts and errors | read-only |
+| `remember(content, kind?, importance?, supersedes?, force?)` | Keep a fact about the user. Similar existing memories are returned for review instead of being duplicated or overwritten | write |
+| `recall(query?, kinds?, limit?)` | Memories ranked by relevance × importance × recency | read-only |
+| `list_memories(kinds?, include_superseded?)` | Everything remembered | read-only |
+| `review_memories()` | Possible duplicates and stale minor memories (changes nothing) | read-only |
+| `forget(memory_id)` | Delete a memory and its earlier versions | **destructive** |
 
 **Resources**, which the user or client can attach as context:
 - `kb://notes/{note_id}`: a note rendered as Markdown
 - `kb://tags`: every tag with its note count
 - `kb://stats`: counts of notes, bookmarks and tags
 - `kb://imports`: the last 20 import runs
+- `kb://memories`: everything remembered, grouped by kind
 
 **Prompts**, as reusable workflows:
 - `summarize_tag(tag)`: summarise everything under a topic, with citations
 - `find_related(note_id)`: have the model search for connected notes and explain the links
+- `start_with_memory(topic?)`: open a conversation by recalling relevant memories
 
 ## How semantic search works
 
@@ -131,6 +138,45 @@ crontab -e
 45 7 * * * /ABSOLUTE/PATH/TO/.venv/bin/kb-mcp ingest folder ~/Notes --prune >> ~/.kb-mcp/ingest.log 2>&1
 ```
 
+## Agent memory (Phase 5)
+
+Notes are documents you choose to save. **Memories** are short facts the assistant picks up on its own while you talk ("prefers concise answers", "applying for data engineering roles", "decided on DuckDB over Postgres"), so the next conversation starts with that context.
+
+**Ranking.** Recall combines three signals, following the recency × importance × relevance idea from *Generative Agents* (Park et al., 2023):
+
+```
+score = 0.6 × relevance  +  0.25 × importance/5  +  0.15 × 0.5^(age_days / 30)
+```
+
+- *relevance* is the cosine similarity to the current topic. With no topic, everything counts as relevant, so "what do you know about me?" returns the most important and recent memories.
+- *importance* (1–5) is set by the assistant when it saves the memory.
+- *recency* halves every 30 days since the memory was last confirmed.
+
+**Memories are never silently rewritten, and embeddings never decide what counts as "the same".** The first design merged any new memory with cosine ≥ 0.92 to an existing one. Measuring that threshold on the real model (`kb-mcp eval --memory`) showed the idea itself was wrong, not just the number:
+
+| Pair | Relation | Cosine |
+|---|---|---|
+| "Applying for data engineering jobs" / "Is job hunting for data engineer roles" | same fact | 0.880 |
+| "Lives in Virginia" / "Lives in Maryland" | **conflict** | **0.827** |
+| "Prefers concise answers" / "Likes short, concise replies" | same fact | 0.819 |
+| "Uses DuckDB for analytics" / "Uses Postgres for analytics" | **conflict** | **0.815** |
+| "Prefers concise answers" / "Prefers detailed explanations" | **conflict** | **0.798** |
+| "Uses Python for most projects" / "Writes most of their code in Python" | same fact | 0.783 |
+| "Working on the NBA data platform" / "Working on the Olist delivery project" | unrelated | 0.634 |
+| "Has a dog named Max" / "Likes hiking on weekends" | unrelated | 0.435 |
+
+Rewordings of one fact (0.78–0.88) and *contradictory* facts (0.80–0.83) overlap completely, so any merge threshold either duplicates memories or silently overwrites "Maryland" with "Virginia". The design was changed so that:
+- **Only identical text** (ignoring case and spacing, same kind) is merged automatically.
+- **Anything similar (cosine ≥ 0.75) is not saved.** `remember` returns `needs_review` with the similar memories, and the assistant, which understands the sentences, decides. If it's the *same fact*, it does nothing. If the *fact changed*, it calls `remember(..., supersedes=<id>)`, which keeps the old version as history but hides it from recall. If it's a *different fact*, it calls `remember(..., force=true)`.
+- At 0.75, every same-fact and conflicting pair above is surfaced for review, and both unrelated pairs are saved directly.
+- `review_memories` uses the same threshold to list possible duplicates and stale minor memories. It deletes nothing itself.
+
+**Privacy and control:**
+- Memories live in the same local SQLite file as the notes.
+- The server instructions tell the assistant not to store secrets, credentials or sensitive personal details unless asked.
+- `forget` deletes a memory together with its history.
+- `kb-mcp memories` lists everything, and `kb-mcp memories --export memories.json` exports it.
+
 ## Design decisions
 
 - **The storage layer knows nothing about MCP.** `store.py` is plain Python + SQLite, and `server.py` is a thin protocol layer over it. Later phases (vector search, ingestion) plug in behind the same interface.
@@ -146,7 +192,7 @@ crontab -e
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest                         # 72 tests: storage, search, ingestion, protocol, real stdio round-trip
+pytest                         # 90 tests: storage, search, ingestion, memory, protocol, real stdio round-trip
 kb-mcp reindex                 # one-time: downloads the embedding model and embeds existing notes
 kb-mcp eval                    # keyword vs semantic vs hybrid vs re-ranked, by query type
 kb-mcp --rerank                # serve with cross-encoder re-ranking on
@@ -184,6 +230,7 @@ npx @modelcontextprotocol/inspector .venv/bin/kb-mcp
 | `tests/test_store.py` | CRUD, tag normalisation, BM25 ranking (title > body), prefix search, index consistency after update and delete, FTS-syntax safety, persistence |
 | `tests/test_semantic.py` | Chunking, embedding on write, staleness after edits and model changes, legacy-database backfill, best-chunk ranking, tag filter, similarity, failure never losing a write, RRF fusion, identifier rescue, re-ranking, eval harness and dataset integrity |
 | `tests/test_ingest.py` | Folder parsing (front matter, headings, hashtags, hidden folders), idempotent re-runs, change detection with re-embedding, scoped prune, per-item failures, bookmark parsing, URL normalisation and dedup, readable-text extraction, SSRF guard |
+| `tests/test_memory.py` | Validation, identical-text merging, needs-review for similar memories, force and supersede paths, supersede history, relevance/importance/recency ranking with a fake clock, filtering irrelevant memories, forgetting whole chains, review, no-model fallback, persistence, export, tools end to end |
 | `tests/test_server.py` | Through a real MCP client (in-process): tool schemas and annotations, structured output, error contract, input validation, pagination, resources, prompts, search modes, fallback notices |
 | `tests/test_stdio.py` | The server launched as a subprocess over stdio, the way Claude Desktop runs it |
 
@@ -195,13 +242,14 @@ npx @modelcontextprotocol/inspector .venv/bin/kb-mcp
 | 2. Semantic search | Local embeddings, chunking, vector search, `find_similar`, retrieval eval | ✅ |
 | 3. Hybrid search | BM25 + vectors with RRF, cross-encoder re-ranking, harder evaluation (identifier and near-duplicate queries) | ✅ |
 | 4. Ingestion pipeline | Folders, bookmark exports, web pages; idempotent upserts, URL dedup, scoped prune, run log, SSRF-safe fetching | ✅ |
-| 5. Agent memory | Memories the assistant writes itself, with recency and importance scoring | |
+| 5. Agent memory | Memories the assistant writes itself: model-judged dedup and supersede, recency × importance × relevance recall, review, forget, export | ✅ |
 
 ## Layout
 
 ```
 src/kb_mcp/store.py        SQLite storage: notes, FTS5 keyword index, embeddings (no MCP dependency)
 src/kb_mcp/embeddings.py   embedding + re-ranking models (local fastembed, offline test doubles) and chunking
+src/kb_mcp/memory.py       agent memory: remember / recall / supersede / review / forget
 src/kb_mcp/ingest.py       ingestion: folder, bookmarks and web sources, the idempotent pipeline, SSRF guard
 src/kb_mcp/evaluate.py     retrieval evaluation (recall@5, MRR, nDCG@5, latency) on eval_data.json
 src/kb_mcp/server.py       MCP tools, resources, prompts, CLI entry point

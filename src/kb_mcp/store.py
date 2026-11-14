@@ -20,10 +20,11 @@ from pathlib import Path
 import numpy as np
 
 from kb_mcp.embeddings import Embedder, Reranker, chunk_text
+from kb_mcp.memory import MemoryStore
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 create table if not exists notes (
@@ -210,6 +211,7 @@ class KnowledgeStore:
             self._conn.execute("pragma journal_mode = wal")
         self._conn.executescript(_SCHEMA)
         self._conn.execute(f"pragma user_version = {SCHEMA_VERSION}")
+        self.memory = MemoryStore(self._conn, embedder)
 
     def close(self) -> None:
         self._conn.close()
@@ -297,6 +299,7 @@ class KnowledgeStore:
             "bookmarks": c.execute("select count(*) from notes where url is not null").fetchone()[0],
             "tags": c.execute("select count(distinct tag) from note_tags").fetchone()[0],
             "embedded_chunks": c.execute("select count(*) from note_chunks").fetchone()[0],
+            "memories": c.execute("select count(*) from memories where superseded_by is null").fetchone()[0],
         }
 
     # ------------------------------------------------------------------ writes

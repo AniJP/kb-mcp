@@ -84,7 +84,7 @@ def test_tag_filter_and_pagination(store):
 def test_stats_split_notes_and_bookmarks(store):
     store.add("a note")
     store.add("a link", url="https://example.com", tags=["web"])
-    assert store.stats() == {"notes": 1, "bookmarks": 1, "tags": 1, "embedded_chunks": 0}
+    assert store.stats() == {"notes": 1, "bookmarks": 1, "tags": 1, "embedded_chunks": 0, "memories": 0}
 
 
 def test_persists_to_disk(tmp_path):

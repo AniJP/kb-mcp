@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 
 from kb_mcp.embeddings import FastEmbedEmbedder, FastEmbedReranker, Reranker
 from kb_mcp.ingest import fetch_html, ingest_url
+from kb_mcp.memory import KINDS, Memory, MemoryNotFound
 from kb_mcp.store import KnowledgeStore, Note, NoteNotFound, SearchHit
 
 log = logging.getLogger(__name__)
@@ -40,6 +41,20 @@ A personal knowledge base of notes and bookmarks.
 - Use add_note / save_bookmark only when the user asks to save something.
 - import_url fetches a web page into the knowledge base; use it when the user asks to save an article.
 - delete_note is permanent: confirm with the user first.
+
+Memory (separate from notes):
+- At the start of a conversation, call recall with the topic at hand to load relevant context.
+- Call remember when the user states something durable and useful later: a preference, an
+  ongoing project, a decision, a stable fact about their situation. Keep each memory to one
+  short sentence in third person ("Prefers concise answers").
+- If remember answers needs_review, compare the new fact with each similar memory:
+  same fact -> do nothing; the fact changed -> call remember again with supersedes=<old id>;
+  genuinely different -> call remember again with force=true.
+- If you already know a fact changed, pass supersedes=<old id> directly.
+- Do not remember passing remarks, secrets, credentials or sensitive personal details
+  (health, finances, identity documents) unless the user explicitly asks you to.
+- When the user asks what you know about them, use recall without a query. When they ask you
+  to forget something, use forget.
 """
 
 READ = ToolAnnotations(read_only_hint=True, idempotent_hint=True, open_world_hint=False)
@@ -124,6 +139,60 @@ class ImportRun(BaseModel):
     errors: list[str]
 
 
+MemoryKind = Literal["preference", "fact", "project", "decision", "event"]
+assert set(KINDS) == {"preference", "fact", "project", "decision", "event"}
+
+
+class MemoryOut(BaseModel):
+    id: int
+    content: str
+    kind: MemoryKind
+    importance: int = Field(description="1 (minor) to 5 (essential)")
+    created_at: str
+    updated_at: str
+    superseded_by: int | None = Field(None, description="Set when a newer memory replaced this one")
+
+    @classmethod
+    def of(cls, m: Memory) -> MemoryOut:
+        return cls(**m.__dict__)
+
+
+class RememberResult(BaseModel):
+    outcome: Literal["created", "merged", "superseded", "needs_review"] = Field(
+        description="created: saved. merged: identical memory existed and was refreshed. superseded: saved, "
+                    "replacing `supersedes`. needs_review: NOT saved, see `similar` and decide."
+    )
+    memory: MemoryOut | None = Field(None, description="The saved memory (absent for needs_review)")
+    similar: list[MemoryOut] = Field(
+        default_factory=list,
+        description="For needs_review: existing memories that may say the same thing or contradict the new one. "
+                    "Same fact: do nothing. Changed fact: call remember with supersedes=<id>. "
+                    "Different fact: call remember with force=true.",
+    )
+
+
+class RecalledMemory(MemoryOut):
+    score: float = Field(description="Combined relevance, importance and recency; higher is better")
+    relevance: float
+    recency: float
+
+
+class RecallResult(BaseModel):
+    query: str | None
+    memories: list[RecalledMemory]
+
+
+class DuplicatePair(BaseModel):
+    a: MemoryOut
+    b: MemoryOut
+    similarity: float
+
+
+class MemoryReview(BaseModel):
+    possible_duplicates: list[DuplicatePair]
+    stale: list[MemoryOut] = Field(description="Low-importance memories not updated in 6+ months")
+
+
 class Deleted(BaseModel):
     id: int
     title: str
@@ -148,7 +217,7 @@ def _not_found(e: NoteNotFound) -> ToolError:
 
 
 def create_server(store: KnowledgeStore, reranker: Reranker | None = None, fetch=fetch_html) -> MCPServer:
-    mcp = MCPServer(name="knowledge-base", version="0.4.0", instructions=INSTRUCTIONS)
+    mcp = MCPServer(name="knowledge-base", version="0.5.0", instructions=INSTRUCTIONS)
 
     # ----------------------------------------------------------------- tools: read
 
@@ -310,6 +379,76 @@ def create_server(store: KnowledgeStore, reranker: Reranker | None = None, fetch
         """Recent import runs (folders, bookmark files, web pages) with what each added or changed."""
         return [ImportRun(**r) for r in store.recent_runs(limit)]
 
+    # ----------------------------------------------------------------- tools: memory
+
+    mem = store.memory
+
+    def _memory_error(e: MemoryNotFound) -> ToolError:
+        return ToolError(f"No memory with id {e.memory_id}. Use recall or list_memories to find it.")
+
+    @mcp.tool(title="Remember", annotations=WRITE)
+    def remember(
+        content: Annotated[str, Field(min_length=3, max_length=500,
+                                      description="One short, self-contained sentence, e.g. 'Prefers Python over R'")],
+        kind: Annotated[MemoryKind, Field(description="preference, fact, project, decision or event")] = "fact",
+        importance: Annotated[int, Field(ge=1, le=5, description="1 minor detail ... 5 essential context")] = 3,
+        supersedes: Annotated[int | None, Field(description="Id of a memory this one replaces (fact changed)")] = None,
+        force: Annotated[bool, Field(description="Save even though similar memories exist (after review)")] = False,
+    ) -> RememberResult:
+        """Keep something about the user for future conversations.
+
+        If similar memories already exist, nothing is saved and they are returned for you to judge.
+        """
+        try:
+            outcome, m, similar = mem.remember(content, kind, importance, supersedes, force)
+        except MemoryNotFound as e:
+            raise _memory_error(e) from e
+        except ValueError as e:
+            raise ToolError(str(e)) from e
+        return RememberResult(outcome=outcome, memory=MemoryOut.of(m) if m else None,
+                              similar=[MemoryOut.of(x) for x in similar])
+
+    @mcp.tool(title="Recall", annotations=READ)
+    def recall(
+        query: Annotated[str | None, Field(description="What the conversation is about. Omit to get the most "
+                                                      "important recent memories overall.")] = None,
+        kinds: Annotated[list[MemoryKind] | None, Field(description="Only these kinds")] = None,
+        limit: Annotated[int, Field(ge=1, le=30)] = 8,
+    ) -> RecallResult:
+        """Retrieve memories ranked by relevance to the query, importance and recency."""
+        hits = mem.recall(query, kinds, limit)
+        return RecallResult(query=query, memories=[
+            RecalledMemory(**MemoryOut.of(h.memory).model_dump(), score=h.score, relevance=h.relevance,
+                           recency=h.recency) for h in hits
+        ])
+
+    @mcp.tool(title="List memories", annotations=READ)
+    def list_memories(
+        kinds: Annotated[list[MemoryKind] | None, Field(description="Only these kinds")] = None,
+        include_superseded: Annotated[bool, Field(description="Also show replaced versions")] = False,
+    ) -> list[MemoryOut]:
+        """Every memory, newest first. Use this when the user wants to see everything you keep."""
+        return [MemoryOut.of(m) for m in mem.list(kinds, include_superseded)]
+
+    @mcp.tool(title="Review memories", annotations=READ)
+    def review_memories() -> MemoryReview:
+        """Find possible duplicates and stale minor memories to tidy up. Changes nothing by itself."""
+        r = mem.review()
+        return MemoryReview(
+            possible_duplicates=[DuplicatePair(a=MemoryOut.of(p["a"]), b=MemoryOut.of(p["b"]),
+                                               similarity=p["similarity"]) for p in r["possible_duplicates"]],
+            stale=[MemoryOut.of(m) for m in r["stale"]],
+        )
+
+    @mcp.tool(title="Forget", annotations=DELETE)
+    def forget(memory_id: Annotated[int, Field(ge=1)]) -> Deleted:
+        """Permanently delete a memory, including earlier versions it replaced."""
+        try:
+            m = mem.forget(memory_id)
+        except MemoryNotFound as e:
+            raise _memory_error(e) from e
+        return Deleted(id=m.id, title=m.content)
+
     # ----------------------------------------------------------------- resources
 
     @mcp.resource("kb://notes/{note_id}", name="note", title="Note", mime_type="text/markdown")
@@ -331,6 +470,20 @@ def create_server(store: KnowledgeStore, reranker: Reranker | None = None, fetch
     def tags_resource() -> str:
         """Every tag with its note count."""
         return json.dumps([{"tag": t, "count": n} for t, n in store.tags()])
+
+    @mcp.resource("kb://memories", name="memories", title="What the assistant remembers", mime_type="text/markdown")
+    def memories_resource() -> str:
+        """All active memories grouped by kind, as Markdown."""
+        items = mem.list()
+        if not items:
+            return "No memories yet.\n"
+        lines = ["# What I remember", ""]
+        for kind in KINDS:
+            group = [m for m in items if m.kind == kind]
+            if group:
+                lines += [f"## {kind.capitalize()}s", *[f"- [{m.id}] {m.content} (importance {m.importance})"
+                                                        for m in group], ""]
+        return "\n".join(lines)
 
     @mcp.resource("kb://imports", name="imports", title="Import history", mime_type="application/json")
     def imports_resource() -> str:
@@ -359,6 +512,16 @@ def create_server(store: KnowledgeStore, reranker: Reranker | None = None, fetch
                 "and point out gaps or contradictions."
             )
         ]
+
+    @mcp.prompt(title="Start with memory")
+    def start_with_memory(topic: str = "") -> list[UserMessage]:
+        """Begin a conversation using what the assistant remembers about the user."""
+        about = f" about {topic}" if topic else ""
+        return [UserMessage(
+            f"Before we start{about}: call the recall tool{' with this topic' if topic else ''} and use what you "
+            "remember about me to tailor your help. Briefly tell me which memories you are relying on, and "
+            "remember anything new and durable I tell you during this conversation."
+        )]
 
     @mcp.prompt(title="Find related notes")
     def find_related(note_id: str) -> list[UserMessage]:
@@ -389,19 +552,24 @@ def main() -> None:
     kb-mcp --http          serve over Streamable HTTP
     kb-mcp reindex         embed any notes missing embeddings (also downloads the model once)
     kb-mcp eval            compare keyword, semantic, hybrid and re-ranked retrieval on the bundled test set
+    kb-mcp eval --memory   check memory merge / review thresholds against the real model
     kb-mcp ingest folder PATH [--prune]   import Markdown/text notes (re-run any time; only changes apply)
     kb-mcp ingest bookmarks FILE          import a browser bookmarks export (.html)
     kb-mcp ingest url URL [--tag T]       import one web page
     kb-mcp runs                           show recent import runs
+    kb-mcp memories [--export FILE]       list what the assistant remembers (or export it as JSON)
     """
     import argparse
 
     parser = argparse.ArgumentParser(description="Personal knowledge-base MCP server")
-    parser.add_argument("command", nargs="?", default="serve", choices=["serve", "reindex", "eval", "ingest", "runs"])
+    commands = ["serve", "reindex", "eval", "ingest", "runs", "memories"]
+    parser.add_argument("command", nargs="?", default="serve", choices=commands)
     parser.add_argument("target", nargs="*", help="for ingest: folder PATH | bookmarks FILE | url URL")
     parser.add_argument("--prune", action="store_true",
                         help="ingest folder: delete notes whose file was removed (only notes from that folder)")
     parser.add_argument("--tag", action="append", default=[], help="ingest url: tag to add (repeatable)")
+    parser.add_argument("--memory", action="store_true", help="eval: check memory merge thresholds instead")
+    parser.add_argument("--export", metavar="FILE", help="memories: write every memory (with history) as JSON")
     parser.add_argument("--db", default=os.environ.get("KB_DB_PATH", "~/.kb-mcp/kb.db"), help="SQLite file")
     parser.add_argument("--no-semantic", action="store_true", help="keyword search only (no embedding model)")
     parser.add_argument("--rerank", action="store_true", help="re-order hybrid results with a cross-encoder")
@@ -411,15 +579,27 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "eval":
-        from kb_mcp.evaluate import main as eval_main
+        from kb_mcp import evaluate
 
-        eval_main()
+        evaluate.print_memory_thresholds() if args.memory else evaluate.main()
         return
 
     store = build_store(args.db, semantic=not args.no_semantic)
     if args.command == "reindex":
         n = store.reindex()
         print(f"embedded {n} note(s) with {store.embedder.name if store.embedder else 'no model'}")
+        return
+    if args.command == "memories":
+        if args.export:
+            from pathlib import Path
+
+            Path(args.export).expanduser().write_text(store.memory.export())
+            print(f"exported to {args.export}")
+            return
+        items = store.memory.list()
+        for m in items:
+            print(f"[{m.id:>3}] {m.kind:<10} imp {m.importance}  {m.content}")
+        print(f"{len(items)} active memories")
         return
     if args.command == "runs":
         for r in store.recent_runs(10):
